@@ -1,0 +1,37 @@
+# Data Room Graph - Dependencies
+# Python 3.11+ required
+
+# Core
+pydantic>=2.0
+pydantic-settings>=2.0
+python-dotenv>=1.0
+
+# Neo4j
+neo4j>=5.0
+neo4j-graphrag>=0.5
+
+# Unstructured
+unstructured-client>=0.20
+
+# Embeddings
+openai>=1.0
+
+# LLM
+anthropic>=0.40
+
+# UI
+PySide6>=6.6
+
+# Async HTTP
+aiohttp>=3.9
+httpx>=0.25
+
+# Retry logic
+tenacity>=8.0
+
+# Windows file handling
+pywin32>=306;sys_platform=="win32"
+
+# Development
+pytest>=7.0
+pytest-asyncio>=0.21

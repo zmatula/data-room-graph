@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data-room-graph"
+version = "0.1.0"
+description = "Recursive Agentic GraphRAG System for Private Equity Fund Data Rooms"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Data Room Graph Team"}
+]
+dependencies = [
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    "neo4j>=5.0",
+    "neo4j-graphrag>=0.5",
+    "unstructured-client>=0.20",
+    "openai>=1.0",
+    "anthropic>=0.40",
+    "PySide6>=6.6",
+    "PySide6-WebEngine>=6.6",
+    "networkx>=3.0",
+    "aiohttp>=3.9",
+    "httpx>=0.25",
+    "tenacity>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+windows = [
+    "pywin32>=306",
+]
+
+[project.scripts]
+data-room-graph = "ui.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

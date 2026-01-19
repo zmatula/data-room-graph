@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Data Room Graph</title>
+    <script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background-color: #1a1a2e;
+            overflow: hidden;
+            color: #e8e8f0;
+        }
+        #graph-container {
+            width: 100vw;
+            height: 100vh;
+        }
+        #controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: #1f1f3d;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #3d3d6b;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 100;
+        }
+        #controls h3 {
+            margin-bottom: 10px;
+            font-size: 14px;
+            color: #e8e8f0;
+        }
+        .layer-toggle {
+            display: flex;
+            align-items: center;
+            margin: 6px 0;
+        }
+        .layer-toggle input {
+            margin-right: 8px;
+            accent-color: #8b5cf6;
+        }
+        .layer-toggle label {
+            font-size: 13px;
+            color: #a0a0b8;
+        }
+        #node-details {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            width: 300px;
+            max-height: calc(100vh - 20px);
+            background: #1f1f3d;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #3d3d6b;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 100;
+            display: none;
+            overflow-y: auto;
+        }
+        #node-details.visible {
+            display: block;
+        }
+        #node-details h3 {
+            margin-bottom: 12px;
+            color: #e8e8f0;
+        }
+        #node-details .close-btn {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: none;
+            border: none;
+            font-size: 18px;
+            cursor: pointer;
+            color: #6b6b85;
+        }
+        #node-details .close-btn:hover {
+            color: #e8e8f0;
+        }
+        .detail-row {
+            margin: 8px 0;
+            font-size: 13px;
+        }
+        .detail-label {
+            font-weight: 500;
+            color: #a0a0b8;
+        }
+        .detail-value {
+            color: #e8e8f0;
+            margin-top: 2px;
+        }
+        .action-btn {
+            display: inline-block;
+            padding: 6px 12px;
+            margin: 4px 4px 4px 0;
+            background: #8b5cf6;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .action-btn:hover {
+            background: #a78bfa;
+        }
+        .action-btn.secondary {
+            background: #252547;
+            border: 1px solid #3d3d6b;
+            color: #e8e8f0;
+        }
+        .action-btn.secondary:hover {
+            background: #4c1d95;
+            border-color: #8b5cf6;
+        }
+        #legend {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            background: #1f1f3d;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #3d3d6b;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            z-index: 100;
+        }
+        #legend h4 {
+            margin-bottom: 8px;
+            font-size: 12px;
+            color: #a0a0b8;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin: 4px 0;
+            font-size: 11px;
+            color: #e8e8f0;
+        }
+        .legend-color {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 6px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+        /* Scrollbar styling for node details */
+        #node-details::-webkit-scrollbar {
+            width: 8px;
+        }
+        #node-details::-webkit-scrollbar-track {
+            background: #1a1a2e;
+            border-radius: 4px;
+        }
+        #node-details::-webkit-scrollbar-thumb {
+            background: #3d3d6b;
+            border-radius: 4px;
+        }
+        #node-details::-webkit-scrollbar-thumb:hover {
+            background: #4a4a7d;
+        }
+        .expandable-section {
+            margin-top: 12px;
+            border-top: 1px solid #3d3d6b;
+            padding-top: 12px;
+        }
+        .expandable-header {
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+            padding: 6px 0;
+        }
+        .expandable-header:hover {
+            color: #a78bfa;
+        }
+        .expand-icon {
+            margin-right: 8px;
+            transition: transform 0.2s;
+            font-size: 10px;
+        }
+        .expand-icon.expanded {
+            transform: rotate(90deg);
+        }
+        .expandable-content {
+            display: none;
+            padding-left: 18px;
+            margin-top: 8px;
+        }
+        .expandable-content.visible {
+            display: block;
+        }
+        .property-row {
+            margin: 4px 0;
+            font-size: 12px;
+            word-break: break-word;
+        }
+        .property-key {
+            color: #a78bfa;
+            font-weight: 500;
+        }
+        .property-value {
+            color: #e8e8f0;
+            margin-left: 4px;
+        }
+        .relationship-item {
+            background: #252547;
+            border: 1px solid #3d3d6b;
+            border-radius: 6px;
+            padding: 10px;
+            margin: 8px 0;
+        }
+        .relationship-type {
+            color: #fbbf24;
+            font-weight: 600;
+            font-size: 12px;
+            margin-bottom: 4px;
+        }
+        .relationship-direction {
+            color: #a0a0b8;
+            font-size: 11px;
+        }
+        .relationship-target {
+            color: #60a5fa;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+        .relationship-props {
+            margin-top: 6px;
+            padding-top: 6px;
+            border-top: 1px dashed #3d3d6b;
+        }
+        .loading-indicator {
+            color: #a0a0b8;
+            font-style: italic;
+            font-size: 12px;
+        }
+        .no-data {
+            color: #6b6b85;
+            font-style: italic;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div id="graph-container"></div>
+
+    <div id="controls">
+        <h3>Layers</h3>
+        <div class="layer-toggle">
+            <input type="checkbox" id="layer-structure" checked>
+            <label for="layer-structure">Document Structure</label>
+        </div>
+        <div class="layer-toggle">
+            <input type="checkbox" id="layer-entities" checked>
+            <label for="layer-entities">Entities</label>
+        </div>
+        <div class="layer-toggle">
+            <input type="checkbox" id="layer-mentions" checked>
+            <label for="layer-mentions">Mention Edges</label>
+        </div>
+    </div>
+
+    <div id="node-details">
+        <button class="close-btn" onclick="hideDetails()">&times;</button>
+        <h3 id="detail-title">Node Details</h3>
+        <div id="detail-content"></div>
+    </div>
+
+    <div id="legend">
+        <h4>Node Types</h4>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #60a5fa;"></div>
+            <span>Document</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #34d399;"></div>
+            <span>Chunk</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #fbbf24;"></div>
+            <span>Fund</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #a78bfa;"></div>
+            <span>Manager</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #f87171;"></div>
+            <span>Person</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #2dd4bf;"></div>
+            <span>Service Provider</span>
+        </div>
+    </div>
+
+    <script>
+        // Node color mapping - optimized for dark background
+        const NODE_COLORS = {
+            'DataRoom': '#4a5568',
+            'Folder': '#5a6678',
+            'Document': '#60a5fa',
+            'Chunk': '#34d399',
+            'Fund': '#fbbf24',
+            'Manager': '#a78bfa',
+            'Person': '#f87171',
+            'Vehicle': '#fb923c',
+            'ServiceProvider': '#2dd4bf',
+            'Investor': '#38bdf8',
+            'Entity': '#94a3b8'
+        };
+
+        // Node shape mapping
+        const NODE_SHAPES = {
+            'DataRoom': 'diamond',
+            'Folder': 'triangle',
+            'Document': 'square',
+            'Chunk': 'dot',
+            'Fund': 'star',
+            'Manager': 'hexagon',
+            'Person': 'dot',
+            'Vehicle': 'triangle',
+            'ServiceProvider': 'square',
+            'Investor': 'dot',
+            'Entity': 'dot'
+        };
+
+        let network = null;
+        let allNodes = [];
+        let allEdges = [];
+        let currentNodes = new vis.DataSet([]);
+        let currentEdges = new vis.DataSet([]);
+
+        // Initialize the graph
+        function initGraph(nodes, edges) {
+            console.log('initGraph called with', nodes.length, 'nodes and', edges.length, 'edges');
+
+            // Count node types
+            const typeCounts = {};
+            nodes.forEach(n => {
+                typeCounts[n.type] = (typeCounts[n.type] || 0) + 1;
+            });
+            console.log('Node types:', typeCounts);
+
+            allNodes = nodes;
+            allEdges = edges;
+
+            const container = document.getElementById('graph-container');
+
+            const options = {
+                nodes: {
+                    font: {
+                        size: 12,
+                        face: 'Segoe UI',
+                        color: '#e8e8f0'
+                    },
+                    scaling: {
+                        min: 10,
+                        max: 30,
+                        label: {
+                            enabled: true,
+                            min: 10,
+                            max: 20
+                        }
+                    },
+                    borderWidth: 2,
+                    shadow: {
+                        enabled: true,
+                        color: 'rgba(0,0,0,0.3)',
+                        size: 8
+                    }
+                },
+                edges: {
+                    arrows: {
+                        to: { enabled: true, scaleFactor: 0.5 }
+                    },
+                    smooth: {
+                        type: 'continuous',
+                        roundness: 0.5
+                    },
+                    color: {
+                        color: '#4a4a7d',
+                        highlight: '#8b5cf6',
+                        hover: '#a78bfa'
+                    },
+                    font: {
+                        size: 10,
+                        align: 'middle',
+                        color: '#a0a0b8'
+                    }
+                },
+                physics: {
+                    enabled: true,
+                    stabilization: {
+                        iterations: 100,
+                        fit: true
+                    },
+                    barnesHut: {
+                        gravitationalConstant: -2000,
+                        centralGravity: 0.1,
+                        springLength: 150,
+                        springConstant: 0.04,
+                        damping: 0.09
+                    }
+                },
+                interaction: {
+                    hover: true,
+                    tooltipDelay: 200,
+                    hideEdgesOnDrag: true,
+                    hideEdgesOnZoom: true
+                },
+                layout: {
+                    improvedLayout: true
+                }
+            };
+
+            // Process nodes
+            const processedNodes = nodes.map(node => ({
+                id: node.id,
+                label: node.label || node.name,
+                title: node.title || `${node.type}: ${node.name}`,
+                color: {
+                    background: NODE_COLORS[node.type] || '#94a3b8',
+                    border: NODE_COLORS[node.type] || '#94a3b8',
+                    highlight: {
+                        background: NODE_COLORS[node.type] || '#94a3b8',
+                        border: '#8b5cf6'
+                    },
+                    hover: {
+                        background: NODE_COLORS[node.type] || '#94a3b8',
+                        border: '#a78bfa'
+                    }
+                },
+                shape: NODE_SHAPES[node.type] || 'dot',
+                size: node.size || 15,
+                data: node
+            }));
+
+            // Process edges
+            const processedEdges = edges.map(edge => ({
+                id: edge.id,
+                from: edge.from,
+                to: edge.to,
+                label: edge.label,
+                dashes: edge.type === 'MENTIONS',
+                data: edge
+            }));
+
+            currentNodes = new vis.DataSet(processedNodes);
+            currentEdges = new vis.DataSet(processedEdges);
+
+            network = new vis.Network(container, {
+                nodes: currentNodes,
+                edges: currentEdges
+            }, options);
+
+            // Event handlers
+            network.on('click', function(params) {
+                if (params.nodes.length > 0) {
+                    const nodeId = params.nodes[0];
+                    const node = currentNodes.get(nodeId);
+                    showNodeDetails(node);
+                } else {
+                    hideDetails();
+                }
+            });
+
+            network.on('doubleClick', function(params) {
+                if (params.nodes.length > 0) {
+                    const nodeId = params.nodes[0];
+                    expandNode(nodeId);
+                }
+            });
+
+            // Apply initial layer filters
+            applyLayerFilters();
+        }
+
+        // Store current selected node for relationship loading
+        let currentSelectedNodeId = null;
+        let fullNodeData = null;
+        let nodeRelationships = null;
+
+        // Show node details panel
+        function showNodeDetails(node) {
+            const panel = document.getElementById('node-details');
+            const title = document.getElementById('detail-title');
+            const content = document.getElementById('detail-content');
+
+            const data = node.data;
+            currentSelectedNodeId = node.id;
+            fullNodeData = null;
+            nodeRelationships = null;
+
+            title.textContent = data.name || data.label;
+
+            let html = '';
+            html += `<div class="detail-row"><span class="detail-label">Type:</span><div class="detail-value">${data.type}</div></div>`;
+            html += `<div class="detail-row"><span class="detail-label">ID:</span><div class="detail-value" style="font-size: 11px; word-break: break-all;">${node.id}</div></div>`;
+
+            if (data.doc_type) {
+                html += `<div class="detail-row"><span class="detail-label">Document Type:</span><div class="detail-value">${data.doc_type}</div></div>`;
+            }
+            if (data.page) {
+                html += `<div class="detail-row"><span class="detail-label">Page:</span><div class="detail-value">${data.page}</div></div>`;
+            }
+            if (data.mentions) {
+                html += `<div class="detail-row"><span class="detail-label">Mentions:</span><div class="detail-value">${data.mentions}</div></div>`;
+            }
+            if (data.text) {
+                const preview = data.text.substring(0, 200) + (data.text.length > 200 ? '...' : '');
+                html += `<div class="detail-row"><span class="detail-label">Content Preview:</span><div class="detail-value">${preview}</div></div>`;
+            }
+            if (data.path) {
+                html += `<div class="detail-row"><span class="detail-label">Path:</span><div class="detail-value">${data.path}</div></div>`;
+            }
+
+            // Action buttons
+            html += '<div style="margin-top: 12px;">';
+            html += `<button class="action-btn" onclick="expandNode('${node.id}')">Add to Graph</button>`;
+            if (data.type === 'Document' || data.type === 'Chunk') {
+                html += `<button class="action-btn secondary" onclick="openSource('${data.path || ''}', ${data.page || 0})">Open Source</button>`;
+            }
+            html += '</div>';
+
+            // Full Node Properties Section
+            html += `
+            <div class="expandable-section">
+                <div class="expandable-header" onclick="toggleFullDetails()">
+                    <span class="expand-icon" id="full-details-icon">▶</span>
+                    <span class="detail-label">Full Node Properties</span>
+                </div>
+                <div class="expandable-content" id="full-details-content">
+                    <div class="loading-indicator" id="full-details-loading">Click to load full details...</div>
+                    <div id="full-details-data"></div>
+                </div>
+            </div>`;
+
+            // Relationships Section
+            html += `
+            <div class="expandable-section">
+                <div class="expandable-header" onclick="toggleRelationships()">
+                    <span class="expand-icon" id="relationships-icon">▶</span>
+                    <span class="detail-label">Relationships</span>
+                </div>
+                <div class="expandable-content" id="relationships-content">
+                    <div class="loading-indicator" id="relationships-loading">Click to load relationships...</div>
+                    <div id="relationships-data"></div>
+                </div>
+            </div>`;
+
+            content.innerHTML = html;
+            panel.classList.add('visible');
+        }
+
+        // Toggle full details section
+        function toggleFullDetails() {
+            const icon = document.getElementById('full-details-icon');
+            const content = document.getElementById('full-details-content');
+            const isExpanded = content.classList.contains('visible');
+
+            if (isExpanded) {
+                icon.classList.remove('expanded');
+                content.classList.remove('visible');
+            } else {
+                icon.classList.add('expanded');
+                content.classList.add('visible');
+                // Load full details if not already loaded
+                if (!fullNodeData && currentSelectedNodeId) {
+                    loadFullNodeDetails(currentSelectedNodeId);
+                }
+            }
+        }
+
+        // Toggle relationships section
+        function toggleRelationships() {
+            const icon = document.getElementById('relationships-icon');
+            const content = document.getElementById('relationships-content');
+            const isExpanded = content.classList.contains('visible');
+
+            if (isExpanded) {
+                icon.classList.remove('expanded');
+                content.classList.remove('visible');
+            } else {
+                icon.classList.add('expanded');
+                content.classList.add('visible');
+                // Load relationships if not already loaded
+                if (!nodeRelationships && currentSelectedNodeId) {
+                    loadNodeRelationships(currentSelectedNodeId);
+                }
+            }
+        }
+
+        // Load full node details from Neo4j
+        function loadFullNodeDetails(nodeId) {
+            const loadingEl = document.getElementById('full-details-loading');
+            const dataEl = document.getElementById('full-details-data');
+
+            loadingEl.textContent = 'Loading...';
+            loadingEl.style.display = 'block';
+            dataEl.innerHTML = '';
+
+            if (window.graphBridge) {
+                window.graphBridge.requestFullNodeDetails(nodeId);
+            } else {
+                loadingEl.textContent = 'Bridge not available';
+            }
+        }
+
+        // Load relationships from Neo4j
+        function loadNodeRelationships(nodeId) {
+            const loadingEl = document.getElementById('relationships-loading');
+            const dataEl = document.getElementById('relationships-data');
+
+            loadingEl.textContent = 'Loading...';
+            loadingEl.style.display = 'block';
+            dataEl.innerHTML = '';
+
+            if (window.graphBridge) {
+                window.graphBridge.requestNodeRelationships(nodeId);
+            } else {
+                loadingEl.textContent = 'Bridge not available';
+            }
+        }
+
+        // Called from Python when full node details are ready
+        function displayFullNodeDetails(properties) {
+            fullNodeData = properties;
+            const loadingEl = document.getElementById('full-details-loading');
+            const dataEl = document.getElementById('full-details-data');
+
+            loadingEl.style.display = 'none';
+
+            if (!properties || Object.keys(properties).length === 0) {
+                dataEl.innerHTML = '<div class="no-data">No additional properties</div>';
+                return;
+            }
+
+            let html = '';
+            for (const [key, value] of Object.entries(properties)) {
+                let displayValue = value;
+                if (typeof value === 'object') {
+                    displayValue = JSON.stringify(value, null, 2);
+                } else if (typeof value === 'string' && value.length > 500) {
+                    displayValue = value.substring(0, 500) + '... [truncated]';
+                }
+                html += `<div class="property-row"><span class="property-key">${escapeHtml(key)}:</span><span class="property-value">${escapeHtml(String(displayValue))}</span></div>`;
+            }
+            dataEl.innerHTML = html;
+        }
+
+        // Called from Python when relationships are ready
+        function displayNodeRelationships(relationships) {
+            nodeRelationships = relationships;
+            const loadingEl = document.getElementById('relationships-loading');
+            const dataEl = document.getElementById('relationships-data');
+
+            loadingEl.style.display = 'none';
+
+            if (!relationships || relationships.length === 0) {
+                dataEl.innerHTML = '<div class="no-data">No relationships found</div>';
+                return;
+            }
+
+            let html = '';
+            for (const rel of relationships) {
+                html += `<div class="relationship-item">`;
+                html += `<div class="relationship-type">${escapeHtml(rel.type)}</div>`;
+                html += `<div class="relationship-direction">${rel.direction === 'outgoing' ? '→ Outgoing' : '← Incoming'}</div>`;
+                html += `<div class="relationship-target">`;
+                html += `<strong>${escapeHtml(rel.other_node_type)}:</strong> ${escapeHtml(rel.other_node_name || rel.other_node_id)}`;
+                html += `</div>`;
+
+                // Relationship properties
+                if (rel.properties && Object.keys(rel.properties).length > 0) {
+                    html += `<div class="relationship-props">`;
+                    for (const [key, value] of Object.entries(rel.properties)) {
+                        html += `<div class="property-row"><span class="property-key">${escapeHtml(key)}:</span><span class="property-value">${escapeHtml(String(value))}</span></div>`;
+                    }
+                    html += `</div>`;
+                }
+                html += `</div>`;
+            }
+            dataEl.innerHTML = html;
+        }
+
+        // Helper to escape HTML
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Hide details panel
+        function hideDetails() {
+            document.getElementById('node-details').classList.remove('visible');
+        }
+
+        // Expand a node (add connected nodes)
+        function expandNode(nodeId) {
+            // This would be called via QWebChannel to get more data
+            if (window.graphBridge) {
+                window.graphBridge.requestExpansion(nodeId);
+            }
+        }
+
+        // Open source document
+        function openSource(path, page) {
+            if (window.graphBridge) {
+                window.graphBridge.openDocument(path, page);
+            }
+        }
+
+        // Add new nodes and edges
+        function addData(nodes, edges) {
+            const existingNodeIds = new Set(currentNodes.getIds());
+            const existingEdgeIds = new Set(currentEdges.getIds());
+
+            // Add new nodes
+            const newNodes = nodes.filter(n => !existingNodeIds.has(n.id)).map(node => ({
+                id: node.id,
+                label: node.label || node.name,
+                title: node.title || `${node.type}: ${node.name}`,
+                color: {
+                    background: NODE_COLORS[node.type] || '#94a3b8',
+                    border: NODE_COLORS[node.type] || '#94a3b8',
+                    highlight: {
+                        background: NODE_COLORS[node.type] || '#94a3b8',
+                        border: '#8b5cf6'
+                    },
+                    hover: {
+                        background: NODE_COLORS[node.type] || '#94a3b8',
+                        border: '#a78bfa'
+                    }
+                },
+                shape: NODE_SHAPES[node.type] || 'dot',
+                size: node.size || 15,
+                data: node
+            }));
+
+            // Add new edges
+            const newEdges = edges.filter(e => !existingEdgeIds.has(e.id)).map(edge => ({
+                id: edge.id,
+                from: edge.from,
+                to: edge.to,
+                label: edge.label,
+                dashes: edge.type === 'MENTIONS',
+                data: edge
+            }));
+
+            currentNodes.add(newNodes);
+            currentEdges.add(newEdges);
+
+            applyLayerFilters();
+        }
+
+        // Apply layer visibility filters
+        function applyLayerFilters() {
+            const showStructure = document.getElementById('layer-structure').checked;
+            const showEntities = document.getElementById('layer-entities').checked;
+            const showMentions = document.getElementById('layer-mentions').checked;
+
+            const structureTypes = ['DataRoom', 'Folder', 'Document'];  // Chunks always visible
+            const entityTypes = ['Fund', 'Manager', 'Person', 'Vehicle', 'ServiceProvider', 'Investor', 'Entity'];
+
+            // Update node visibility
+            currentNodes.forEach(node => {
+                let hidden = false;
+                if (structureTypes.includes(node.data.type) && !showStructure) {
+                    hidden = true;
+                }
+                if (entityTypes.includes(node.data.type) && !showEntities) {
+                    hidden = true;
+                }
+                currentNodes.update({ id: node.id, hidden: hidden });
+            });
+
+            // Update edge visibility
+            currentEdges.forEach(edge => {
+                let hidden = false;
+                if (edge.data && edge.data.type === 'MENTIONS' && !showMentions) {
+                    hidden = true;
+                }
+                currentEdges.update({ id: edge.id, hidden: hidden });
+            });
+        }
+
+        // Fit graph to view
+        function fitGraph() {
+            if (network) {
+                network.fit();
+            }
+        }
+
+        // Clear the graph
+        function clearGraph() {
+            currentNodes.clear();
+            currentEdges.clear();
+        }
+
+        // Layer toggle event listeners
+        document.getElementById('layer-structure').addEventListener('change', applyLayerFilters);
+        document.getElementById('layer-entities').addEventListener('change', applyLayerFilters);
+        document.getElementById('layer-mentions').addEventListener('change', applyLayerFilters);
+
+        // Expose functions for Python bridge
+        window.graphAPI = {
+            initGraph: initGraph,
+            addData: addData,
+            fitGraph: fitGraph,
+            clearGraph: clearGraph,
+            showNodeDetails: showNodeDetails,
+            hideDetails: hideDetails,
+            displayFullNodeDetails: displayFullNodeDetails,
+            displayNodeRelationships: displayNodeRelationships
+        };
+
+        // Initialize QWebChannel for Python communication
+        document.addEventListener('DOMContentLoaded', function() {
+            if (typeof QWebChannel !== 'undefined') {
+                new QWebChannel(qt.webChannelTransport, function(channel) {
+                    window.graphBridge = channel.objects.graphBridge;
+                    console.log('QWebChannel bridge initialized');
+                });
+            } else {
+                console.warn('QWebChannel not available');
+            }
+        });
+    </script>
+</body>
+</html>
