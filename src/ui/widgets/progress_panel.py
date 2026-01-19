@@ -133,6 +133,49 @@ class ProgressPanel(QFrame):
         chunk_progress_layout.addWidget(self.chunk_progress_bar, stretch=1)
         layout.addLayout(chunk_progress_layout)
 
+        # Entity extraction section (hidden by default)
+        self.extraction_widget = QWidget()
+        extraction_layout = QVBoxLayout(self.extraction_widget)
+        extraction_layout.setContentsMargins(0, 8, 0, 0)
+        extraction_layout.setSpacing(6)
+
+        # Extraction header
+        extraction_header = QLabel("Entity Extraction")
+        extraction_header.setStyleSheet("font-weight: bold; color: #8b5cf6; font-size: 12px;")
+        extraction_layout.addWidget(extraction_header)
+
+        # Extraction progress bar
+        extraction_progress_layout = QHBoxLayout()
+        extraction_progress_layout.addWidget(QLabel("Documents:"))
+        self.extraction_progress_bar = QProgressBar()
+        self.extraction_progress_bar.setMinimumHeight(20)
+        self.extraction_progress_bar.setFormat("%v / %m")
+        self.extraction_progress_bar.setStyleSheet(
+            """
+            QProgressBar {
+                border: 1px solid #3d3d6b;
+                border-radius: 4px;
+                background-color: #16213e;
+                text-align: center;
+                color: #e8e8f0;
+            }
+            QProgressBar::chunk {
+                background-color: #22c55e;
+                border-radius: 3px;
+            }
+            """
+        )
+        extraction_progress_layout.addWidget(self.extraction_progress_bar, stretch=1)
+        extraction_layout.addLayout(extraction_progress_layout)
+
+        # Entity count label
+        self.entity_count_label = QLabel("Entities discovered: 0")
+        self.entity_count_label.setStyleSheet("color: #22c55e; font-size: 12px;")
+        extraction_layout.addWidget(self.entity_count_label)
+
+        self.extraction_widget.setVisible(False)
+        layout.addWidget(self.extraction_widget)
+
         # Error section (more prominent, with Open Log Folder button)
         self.error_widget = QWidget()
         self.error_widget.setStyleSheet(
@@ -229,6 +272,10 @@ class ProgressPanel(QFrame):
         self.file_progress_bar.setMaximum(100)
         self.chunk_progress_bar.setValue(0)
         self.chunk_progress_bar.setMaximum(100)
+        self.extraction_progress_bar.setValue(0)
+        self.extraction_progress_bar.setMaximum(100)
+        self.entity_count_label.setText("Entities discovered: 0")
+        self.extraction_widget.setVisible(False)
         self.file_label.setText("No file")
         self.elapsed_label.setText("--:--")
         self.error_widget.setVisible(False)
@@ -282,6 +329,12 @@ class ProgressPanel(QFrame):
             self.file_label.setText(f"Processing: {progress.current_file}")
         else:
             self.file_label.setText("Preparing...")
+
+        # Handle entity extraction phase
+        if progress.status == "extracting_entities":
+            self._show_extraction_progress(progress)
+        else:
+            self.extraction_widget.setVisible(False)
 
         # Handle status changes
         if progress.status == "completed":
@@ -374,6 +427,29 @@ class ProgressPanel(QFrame):
             error_message: The error message.
         """
         self.show_error(error_message)
+
+    def _show_extraction_progress(self, progress: IngestionProgress):
+        """Show entity extraction progress.
+
+        Args:
+            progress: Current ingestion progress.
+        """
+        # Update status label
+        self.status_label.setText("Extracting entities...")
+        self.status_label.setStyleSheet(
+            "font-weight: bold; font-size: 14px; color: #8b5cf6;"
+        )
+
+        # Show extraction widget
+        self.extraction_widget.setVisible(True)
+
+        # Update extraction progress bar
+        total_docs = max(progress.total_documents_for_extraction, 1)
+        self.extraction_progress_bar.setMaximum(total_docs)
+        self.extraction_progress_bar.setValue(progress.extracted_documents)
+
+        # Update entity count
+        self.entity_count_label.setText(f"Entities discovered: {progress.entities_found}")
 
     @Slot()
     def _update_elapsed_time(self):

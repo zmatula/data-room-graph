@@ -249,12 +249,67 @@ class GraphViewWidget(QWidget):
                     "type": "CONTAINS",
                 })
 
+            # Get Sections (via Page -> Section relationship)
+            # First get unique sections
+            section_query = """
+            MATCH (s:Section {dataroom_id: $dataroom_id})<-[:HAS_SECTION]-(p:Page)<-[:HAS_PAGE]-(d:Document)
+            RETURN DISTINCT s.id as id, s.title as title, s.description as description,
+                   s.hierarchy_level as level, collect(DISTINCT p.id)[0] as page_id
+            LIMIT 50
+            """
+            section_results = self.neo4j.execute_read(section_query, {"dataroom_id": self._dataroom_id})
+
+            for section in section_results or []:
+                nodes.append({
+                    "id": section["id"],
+                    "name": section["title"][:40] + "..." if len(section["title"]) > 40 else section["title"],
+                    "type": "Section",
+                    "title": section["title"],
+                    "description": section.get("description"),
+                    "level": section.get("level", 0),
+                    "size": 14,
+                })
+                # Edge from Page to Section (use first page)
+                if section.get("page_id"):
+                    edges.append({
+                        "id": f"edge_{section['page_id']}_{section['id']}",
+                        "from": section["page_id"],
+                        "to": section["id"],
+                        "type": "HAS_SECTION",
+                    })
+
+            # Get Pages (limited sample)
+            page_query = """
+            MATCH (p:Page {dataroom_id: $dataroom_id})<-[:HAS_PAGE]-(d:Document)
+            RETURN p.id as id, p.page_number as page_number, d.id as doc_id
+            LIMIT 50
+            """
+            page_results = self.neo4j.execute_read(page_query, {"dataroom_id": self._dataroom_id})
+
+            for page in page_results or []:
+                nodes.append({
+                    "id": page["id"],
+                    "name": f"Page {page['page_number']}",
+                    "type": "Page",
+                    "page_number": page["page_number"],
+                    "size": 8,
+                })
+                # Edge from Document to Page
+                edges.append({
+                    "id": f"edge_{page['doc_id']}_{page['id']}",
+                    "from": page["doc_id"],
+                    "to": page["id"],
+                    "type": "HAS_PAGE",
+                })
+
             # Get Chunks that have MENTIONS relationships (these connect to entities)
+            # Hierarchy: Document -> Page -> Section -> Chunk
             chunk_query = """
             MATCH (c:Chunk {dataroom_id: $dataroom_id})-[:MENTIONS]->(e:Entity)
-            MATCH (c)<-[:HAS_ROOT|CONTAINS*]-(d:Document)
+            MATCH (c)<-[:CONTAINS]-(s:Section)
+            MATCH (c)-[:ON_PAGE]->(p:Page)
             RETURN DISTINCT c.id as id, c.text as text, c.element_type as element_type,
-                   c.page_start as page, d.id as doc_id
+                   p.page_number as page, s.id as section_id
             LIMIT 100
             """
             chunk_results = self.neo4j.execute_read(chunk_query, {"dataroom_id": self._dataroom_id})
@@ -269,13 +324,14 @@ class GraphViewWidget(QWidget):
                     "page": chunk.get("page"),
                     "size": 10,
                 })
-                # Edge from Document to Chunk
-                edges.append({
-                    "id": f"edge_{chunk['doc_id']}_{chunk['id']}",
-                    "from": chunk["doc_id"],
-                    "to": chunk["id"],
-                    "type": "CONTAINS",
-                })
+                # Edge from Section to Chunk
+                if chunk.get("section_id"):
+                    edges.append({
+                        "id": f"edge_{chunk['section_id']}_{chunk['id']}",
+                        "from": chunk["section_id"],
+                        "to": chunk["id"],
+                        "type": "CONTAINS",
+                    })
 
             # Get Entities
             entity_query = """
@@ -285,6 +341,7 @@ class GraphViewWidget(QWidget):
             LIMIT 50
             """
             entity_results = self.neo4j.execute_read(entity_query, {"dataroom_id": self._dataroom_id})
+            logger.info(f"Entity query returned {len(entity_results) if entity_results else 0} entities")
 
             for entity in entity_results or []:
                 nodes.append({
@@ -305,6 +362,7 @@ class GraphViewWidget(QWidget):
 
             # Only add edges for chunks that are in our node set
             chunk_ids = {n["id"] for n in nodes if n["type"] == "Chunk"}
+            mentions_added = 0
             for rel in mentions_results or []:
                 if rel["chunk_id"] in chunk_ids:
                     edges.append({
@@ -313,6 +371,8 @@ class GraphViewWidget(QWidget):
                         "to": rel["entity_id"],
                         "type": "MENTIONS",
                     })
+                    mentions_added += 1
+            logger.info(f"Added {mentions_added} MENTIONS edges (from {len(mentions_results) if mentions_results else 0} total)")
 
             # Log node type breakdown
             node_types = {}
@@ -334,8 +394,13 @@ class GraphViewWidget(QWidget):
             nodes: List of node dictionaries.
             edges: List of edge dictionaries.
         """
+        # Log entity count being sent to JS
+        entity_types = ['Fund', 'Manager', 'Person', 'Vehicle', 'ServiceProvider', 'Investor']
+        entity_count = sum(1 for n in nodes if n.get('type') in entity_types)
+        logger.info(f"Sending to JS: {len(nodes)} nodes ({entity_count} entities), {len(edges)} edges")
+
         def js_callback(result):
-            logger.debug(f"Graph update JS result: {result}")
+            logger.info(f"Graph update JS result: {result}")
 
         js_code = f"""
         (function() {{
@@ -396,6 +461,12 @@ class GraphViewWidget(QWidget):
         if node_id.startswith("document:"):
             logger.info("Expanding as Document")
             self._expand_document(node_id)
+        elif node_id.startswith("section:"):
+            logger.info("Expanding as Section")
+            self._expand_section(node_id)
+        elif node_id.startswith("page:"):
+            logger.info("Expanding as Page")
+            self._expand_page(node_id)
         elif node_id.startswith("chunk:"):
             logger.info("Expanding as Chunk")
             self._expand_chunk(node_id)
@@ -406,7 +477,7 @@ class GraphViewWidget(QWidget):
             logger.warning(f"Unknown node type for expansion: {node_id}")
 
     def _expand_document(self, doc_id: str):
-        """Expand a document node to show chunks.
+        """Expand a document node to show pages.
 
         Args:
             doc_id: Document ID.
@@ -415,19 +486,61 @@ class GraphViewWidget(QWidget):
             logger.warning("Neo4j client not available for document expansion")
             return
 
-        query = """
-        MATCH (d:Document {id: $doc_id})-[:HAS_ROOT]->(c:Chunk)
-        RETURN c.id as id, c.text as text, c.element_type as type,
-               c.page_start as page
+        nodes = []
+        edges = []
+
+        # Get pages (Documents now connect to Pages, which connect to Sections)
+        page_query = """
+        MATCH (d:Document {id: $doc_id})-[:HAS_PAGE]->(p:Page)
+        RETURN p.id as id, p.page_number as page_number
+        ORDER BY p.page_number
         LIMIT 20
         """
 
-        results = self.neo4j.execute_read(query, {"doc_id": doc_id})
+        page_results = self.neo4j.execute_read(page_query, {"doc_id": doc_id})
+
+        for page in page_results or []:
+            nodes.append({
+                "id": page["id"],
+                "name": f"Page {page['page_number']}",
+                "type": "Page",
+                "page_number": page["page_number"],
+                "size": 8,
+            })
+            edges.append({
+                "id": f"edge_{doc_id}_{page['id']}",
+                "from": doc_id,
+                "to": page["id"],
+                "type": "HAS_PAGE",
+            })
+
+        self.add_nodes(nodes, edges)
+
+    def _expand_section(self, section_id: str):
+        """Expand a section node to show chunks and nested sections.
+
+        Args:
+            section_id: Section ID.
+        """
+        if not self.neo4j:
+            logger.warning("Neo4j client not available for section expansion")
+            return
+
+        # Get chunks in this section
+        chunk_query = """
+        MATCH (s:Section {id: $section_id})-[:CONTAINS]->(c:Chunk)
+        OPTIONAL MATCH (c)-[:ON_PAGE]->(p:Page)
+        RETURN c.id as id, c.text as text, c.element_type as type,
+               p.page_number as page
+        LIMIT 20
+        """
+
+        chunk_results = self.neo4j.execute_read(chunk_query, {"section_id": section_id})
 
         nodes = []
         edges = []
 
-        for chunk in results:
+        for chunk in chunk_results or []:
             nodes.append({
                 "id": chunk["id"],
                 "name": chunk["text"][:50] + "..." if len(chunk["text"]) > 50 else chunk["text"],
@@ -437,10 +550,98 @@ class GraphViewWidget(QWidget):
                 "size": 10,
             })
             edges.append({
-                "id": f"edge_{doc_id}_{chunk['id']}",
-                "from": doc_id,
+                "id": f"edge_{section_id}_{chunk['id']}",
+                "from": section_id,
                 "to": chunk["id"],
                 "type": "CONTAINS",
+            })
+
+        # Get nested sections
+        nested_query = """
+        MATCH (s:Section {id: $section_id})-[:CONTAINS]->(nested:Section)
+        RETURN nested.id as id, nested.title as title, nested.hierarchy_level as level
+        LIMIT 10
+        """
+
+        nested_results = self.neo4j.execute_read(nested_query, {"section_id": section_id})
+
+        for nested in nested_results or []:
+            nodes.append({
+                "id": nested["id"],
+                "name": nested["title"][:40] + "..." if len(nested["title"]) > 40 else nested["title"],
+                "type": "Section",
+                "title": nested["title"],
+                "level": nested.get("level", 0),
+                "size": 12,
+            })
+            edges.append({
+                "id": f"edge_{section_id}_{nested['id']}",
+                "from": section_id,
+                "to": nested["id"],
+                "type": "CONTAINS",
+            })
+
+        self.add_nodes(nodes, edges)
+
+    def _expand_page(self, page_id: str):
+        """Expand a page node to show sections and chunks on this page.
+
+        Args:
+            page_id: Page ID.
+        """
+        if not self.neo4j:
+            logger.warning("Neo4j client not available for page expansion")
+            return
+
+        # Get sections on this page (Page -[HAS_SECTION]-> Section)
+        section_query = """
+        MATCH (p:Page {id: $page_id})-[:HAS_SECTION]->(s:Section)
+        RETURN s.id as id, s.title as title
+        LIMIT 10
+        """
+
+        section_results = self.neo4j.execute_read(section_query, {"page_id": page_id})
+
+        nodes = []
+        edges = []
+
+        for section in section_results or []:
+            nodes.append({
+                "id": section["id"],
+                "name": section["title"][:40] + "..." if len(section["title"]) > 40 else section["title"],
+                "type": "Section",
+                "title": section["title"],
+                "size": 14,
+            })
+            edges.append({
+                "id": f"edge_{page_id}_{section['id']}",
+                "from": page_id,
+                "to": section["id"],
+                "type": "HAS_SECTION",
+            })
+
+        # Get chunks on this page (Chunk -[ON_PAGE]-> Page)
+        chunk_query = """
+        MATCH (p:Page {id: $page_id})<-[:ON_PAGE]-(c:Chunk)
+        RETURN c.id as id, c.text as text, c.element_type as type
+        LIMIT 15
+        """
+
+        chunk_results = self.neo4j.execute_read(chunk_query, {"page_id": page_id})
+
+        for chunk in chunk_results or []:
+            nodes.append({
+                "id": chunk["id"],
+                "name": chunk["text"][:40] + "..." if len(chunk["text"]) > 40 else chunk["text"],
+                "type": "Chunk",
+                "text": chunk["text"],
+                "size": 10,
+            })
+            edges.append({
+                "id": f"edge_{chunk['id']}_{page_id}",
+                "from": chunk["id"],
+                "to": page_id,
+                "type": "ON_PAGE",
             })
 
         self.add_nodes(nodes, edges)
@@ -493,9 +694,10 @@ class GraphViewWidget(QWidget):
             logger.warning("Neo4j client not available for entity expansion")
             return
 
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         MATCH (e:Entity {id: $entity_id})<-[r:MENTIONS]-(c:Chunk)
-        MATCH (c)<-[:HAS_ROOT|CONTAINS*]-(d:Document)
+        MATCH (c)-[:ON_PAGE]->(p:Page)<-[:HAS_PAGE]-(d:Document)
         RETURN c.id as chunk_id, c.text as text, d.id as doc_id, d.filename as doc_name
         LIMIT 10
         """

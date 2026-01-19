@@ -13,6 +13,8 @@ NODE_CONSTRAINTS = [
     ("dataroom_id", "DataRoom", "id"),
     ("folder_id", "Folder", "id"),
     ("document_id", "Document", "id"),
+    ("page_id", "Page", "id"),
+    ("section_id", "Section", "id"),
     ("chunk_id", "Chunk", "id"),
     ("fund_id", "Fund", "id"),
     ("manager_id", "Manager", "id"),
@@ -122,6 +124,10 @@ class SchemaManager:
         """
         indexes = [
             ("idx_chunk_doc", "Chunk", "document_id"),
+            ("idx_chunk_section", "Chunk", "section_id"),
+            ("idx_chunk_page", "Chunk", "page_id"),
+            ("idx_page_doc", "Page", "document_id"),
+            ("idx_section_doc", "Section", "document_id"),
             ("idx_folder_dataroom", "Folder", "dataroom_id"),
             ("idx_document_folder", "Document", "folder_id"),
             ("idx_document_type", "Document", "doc_type"),

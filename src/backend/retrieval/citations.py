@@ -20,6 +20,7 @@ class Citation:
     document_path: str
     document_name: str
     page: Optional[int] = None
+    section_title: Optional[str] = None
     offset_start: Optional[int] = None
     offset_end: Optional[int] = None
     snippet: str = ""
@@ -32,8 +33,12 @@ class Citation:
     @property
     def display_text(self) -> str:
         """Human-readable citation text."""
-        page_info = f", p.{self.page}" if self.page else ""
-        return f"{self.document_name}{page_info}"
+        parts = [self.document_name]
+        if self.section_title:
+            parts.append(f"\"{self.section_title}\"")
+        if self.page:
+            parts.append(f"p.{self.page}")
+        return ", ".join(parts)
 
     @property
     def markdown_link(self) -> str:
@@ -47,6 +52,7 @@ class Citation:
             "document_path": self.document_path,
             "document_name": self.document_name,
             "page": self.page,
+            "section_title": self.section_title,
             "offset_start": self.offset_start,
             "offset_end": self.offset_end,
             "snippet": self.snippet,
@@ -103,12 +109,15 @@ class CitationResolver:
         Returns:
             Citation if found, None otherwise.
         """
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         MATCH (c:Chunk {id: $chunk_id})
-        MATCH (c)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        MATCH (c)<-[:CONTAINS]-(section:Section)
+        MATCH (c)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
         OPTIONAL MATCH (c)-[:MENTIONS]->(e:Entity)
         RETURN c.text AS text,
-               c.page_start AS page,
+               page.page_number AS page,
+               section.title AS section_title,
                c.offset_start AS offset_start,
                c.offset_end AS offset_end,
                doc.full_path AS document_path,
@@ -129,6 +138,7 @@ class CitationResolver:
             document_path=result["document_path"],
             document_name=result["document_name"],
             page=result.get("page"),
+            section_title=result.get("section_title"),
             offset_start=result.get("offset_start"),
             offset_end=result.get("offset_end"),
             snippet=snippet,

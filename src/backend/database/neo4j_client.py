@@ -303,6 +303,63 @@ class Neo4jClient:
         results = self.execute_write(query, {"id": node_id})
         return results[0]["deleted"] > 0 if results else False
 
+    def delete_dataroom(self, dataroom_id: str) -> dict[str, int]:
+        """Delete a data room and all its associated nodes from Neo4j.
+
+        Deletes: DataRoom, Folders, Documents, Pages, Sections, Chunks, Entities
+        and all their relationships.
+
+        Args:
+            dataroom_id: ID of the data room to delete.
+
+        Returns:
+            Dictionary with counts of deleted nodes by type.
+        """
+        # Delete all nodes that belong to this data room
+        # We delete in batches to avoid memory issues with large data rooms
+        deleted_counts = {}
+
+        # Order matters: delete leaf nodes first, then work up the hierarchy
+        node_types = [
+            "Chunk",      # Leaf nodes
+            "Entity",     # Entities (connected to chunks)
+            "Section",    # Sections
+            "Page",       # Pages
+            "Document",   # Documents
+            "Folder",     # Folders
+            "DataRoom",   # Root node (deleted by id, not dataroom_id)
+        ]
+
+        for node_type in node_types:
+            if node_type == "DataRoom":
+                # DataRoom node uses id directly
+                query = """
+                MATCH (n:DataRoom {id: $dataroom_id})
+                DETACH DELETE n
+                RETURN count(n) as deleted
+                """
+                params = {"dataroom_id": dataroom_id}
+            else:
+                # Other nodes have dataroom_id property
+                query = f"""
+                MATCH (n:{node_type} {{dataroom_id: $dataroom_id}})
+                DETACH DELETE n
+                RETURN count(n) as deleted
+                """
+                params = {"dataroom_id": dataroom_id}
+
+            try:
+                results = self.execute_write(query, params)
+                count = results[0]["deleted"] if results else 0
+                deleted_counts[node_type] = count
+                if count > 0:
+                    logger.info(f"Deleted {count} {node_type} nodes for dataroom {dataroom_id}")
+            except Exception as e:
+                logger.error(f"Error deleting {node_type} nodes: {e}")
+                deleted_counts[node_type] = 0
+
+        return deleted_counts
+
 
 # Singleton client instance
 _client: Optional[Neo4jClient] = None

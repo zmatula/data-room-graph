@@ -280,6 +280,14 @@
             <span>Document</span>
         </div>
         <div class="legend-item">
+            <div class="legend-color" style="background: #78909c;"></div>
+            <span>Page</span>
+        </div>
+        <div class="legend-item">
+            <div class="legend-color" style="background: #26a69a;"></div>
+            <span>Section</span>
+        </div>
+        <div class="legend-item">
             <div class="legend-color" style="background: #34d399;"></div>
             <span>Chunk</span>
         </div>
@@ -307,6 +315,8 @@
             'DataRoom': '#4a5568',
             'Folder': '#5a6678',
             'Document': '#60a5fa',
+            'Page': '#78909c',
+            'Section': '#26a69a',
             'Chunk': '#34d399',
             'Fund': '#fbbf24',
             'Manager': '#a78bfa',
@@ -322,6 +332,8 @@
             'DataRoom': 'diamond',
             'Folder': 'triangle',
             'Document': 'square',
+            'Page': 'box',
+            'Section': 'triangleDown',
             'Chunk': 'dot',
             'Fund': 'star',
             'Manager': 'hexagon',
@@ -349,10 +361,29 @@
             });
             console.log('Node types:', typeCounts);
 
+            // Count entities specifically
+            const entityTypes = ['Fund', 'Manager', 'Person', 'Vehicle', 'ServiceProvider', 'Investor', 'Entity'];
+            const entityCount = nodes.filter(n => entityTypes.includes(n.type)).length;
+            console.log('Entities received:', entityCount);
+
             allNodes = nodes;
             allEdges = edges;
 
             const container = document.getElementById('graph-container');
+
+            // Update legend with count (for debugging)
+            const legendEl = document.getElementById('legend');
+            if (legendEl) {
+                // Remove old debug div if exists
+                const oldDebug = document.getElementById('debug-info');
+                if (oldDebug) oldDebug.remove();
+
+                const debugDiv = document.createElement('div');
+                debugDiv.id = 'debug-info';
+                debugDiv.style.cssText = 'margin-top: 8px; padding-top: 8px; border-top: 1px solid #3d3d6b; color: #22c55e; font-size: 11px;';
+                debugDiv.innerHTML = `Loaded: ${nodes.length} nodes, ${entityCount} entities<br>Container: ${container.offsetWidth}x${container.offsetHeight}`;
+                legendEl.appendChild(debugDiv);
+            }
 
             const options = {
                 nodes: {
@@ -453,13 +484,58 @@
                 data: edge
             }));
 
+            console.log('Processed nodes count:', processedNodes.length);
+            console.log('Processed edges count:', processedEdges.length);
+            console.log('Sample processed node:', processedNodes[0]);
+
             currentNodes = new vis.DataSet(processedNodes);
             currentEdges = new vis.DataSet(processedEdges);
 
-            network = new vis.Network(container, {
-                nodes: currentNodes,
-                edges: currentEdges
-            }, options);
+            console.log('DataSets created, nodes:', currentNodes.length, 'edges:', currentEdges.length);
+
+            try {
+                network = new vis.Network(container, {
+                    nodes: currentNodes,
+                    edges: currentEdges
+                }, options);
+
+                console.log('Network created successfully');
+                console.log('Node count in DataSet:', currentNodes.length);
+                console.log('Edge count in DataSet:', currentEdges.length);
+
+                // Debug: log first few nodes
+                const nodeArray = currentNodes.get();
+                console.log('First 3 nodes:', nodeArray.slice(0, 3));
+
+                // Update debug info
+                const debugEl = document.getElementById('debug-info');
+                if (debugEl) {
+                    debugEl.innerHTML += '<br>Network: OK';
+                }
+            } catch (e) {
+                console.error('Error creating network:', e);
+                const debugEl = document.getElementById('debug-info');
+                if (debugEl) {
+                    debugEl.innerHTML += '<br>Network ERROR: ' + e.message;
+                    debugEl.style.color = '#ef4444';
+                }
+                return 'ERROR: ' + e.message;
+            }
+
+            // Force fit after stabilization
+            network.once('stabilizationIterationsDone', function() {
+                console.log('Stabilization done, fitting...');
+                network.fit();
+            });
+
+            // Also try fitting after a delay (in case container size wasn't ready)
+            setTimeout(function() {
+                console.log('Delayed fit, container:', container.offsetWidth, 'x', container.offsetHeight);
+                if (network) {
+                    network.redraw();
+                    network.fit();
+                }
+            }, 500);
 
             // Event handlers
             network.on('click', function(params) {
@@ -508,8 +584,20 @@
             if (data.doc_type) {
                 html += `<div class="detail-row"><span class="detail-label">Document Type:</span><div class="detail-value">${data.doc_type}</div></div>`;
             }
+            if (data.page_number !== undefined) {
+                html += `<div class="detail-row"><span class="detail-label">Page Number:</span><div class="detail-value">${data.page_number}</div></div>`;
+            }
             if (data.page) {
                 html += `<div class="detail-row"><span class="detail-label">Page:</span><div class="detail-value">${data.page}</div></div>`;
+            }
+            if (data.title) {
+                html += `<div class="detail-row"><span class="detail-label">Title:</span><div class="detail-value">${data.title}</div></div>`;
+            }
+            if (data.description) {
+                html += `<div class="detail-row"><span class="detail-label">Description:</span><div class="detail-value">${data.description}</div></div>`;
+            }
+            if (data.level !== undefined) {
+                html += `<div class="detail-row"><span class="detail-label">Hierarchy Level:</span><div class="detail-value">${data.level}</div></div>`;
             }
             if (data.mentions) {
                 html += `<div class="detail-row"><span class="detail-label">Mentions:</span><div class="detail-value">${data.mentions}</div></div>`;
@@ -767,7 +855,7 @@
             const showEntities = document.getElementById('layer-entities').checked;
             const showMentions = document.getElementById('layer-mentions').checked;
 
-            const structureTypes = ['DataRoom', 'Folder', 'Document'];  // Chunks always visible
+            const structureTypes = ['DataRoom', 'Folder', 'Document', 'Page', 'Section'];  // Chunks always visible
             const entityTypes = ['Fund', 'Manager', 'Person', 'Vehicle', 'ServiceProvider', 'Investor', 'Entity'];
 
             // Update node visibility

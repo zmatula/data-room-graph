@@ -216,10 +216,11 @@ class EntityLinker:
             Number of entities linked.
         """
         # Get all chunks for document
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
-        MATCH (d:Document {id: $document_id})-[:HAS_ROOT|CONTAINS*]->(c:Chunk)
-        RETURN c.id as id, c.text as text, c.offset_start as offset_start, c.offset_end as offset_end
-        ORDER BY c.sequence_order
+        MATCH (d:Document {id: $document_id})-[:HAS_PAGE]->(p:Page)-[:HAS_SECTION]->(s:Section)-[:CONTAINS]->(c:Chunk)
+        RETURN DISTINCT c.id as id, c.text as text, c.offset_start as offset_start, c.offset_end as offset_end, c.sequence_order as seq
+        ORDER BY seq
         """
 
         chunks_data = self.neo4j.execute_read(query, {"document_id": document_id})
@@ -260,13 +261,14 @@ class EntityLinker:
         Returns:
             List of Evidence objects.
         """
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         MATCH (c:Chunk)-[r:MENTIONS]->(e:Entity {id: $entity_id})
-        MATCH (c)<-[:HAS_ROOT|CONTAINS*]-(d:Document)
+        MATCH (c)-[:ON_PAGE]->(p:Page)<-[:HAS_PAGE]-(d:Document)
         RETURN c.id as chunk_id,
                d.id as document_id,
-               c.page_start as page_start,
-               c.page_end as page_end,
+               p.page_number as page_start,
+               p.page_number as page_end,
                r.offset_start as offset_start,
                r.offset_end as offset_end,
                c.coordinates as coordinates,

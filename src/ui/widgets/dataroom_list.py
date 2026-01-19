@@ -26,6 +26,7 @@ from PySide6.QtGui import QAction
 
 from ...backend.config import get_settings
 from ...backend.database.models import DataRoom
+from ...backend.database.neo4j_client import get_neo4j_client
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +228,18 @@ class DataRoomListWidget(QWidget):
             dr = DataRoom.create(name=name, description=description)
             self._datarooms[dr.id] = dr
             self._save_datarooms()
+
+            # Create DataRoom node in Neo4j
+            try:
+                neo4j = get_neo4j_client()
+                neo4j.create_node(
+                    labels=["DataRoom"],
+                    properties=dr.to_neo4j_properties(),
+                )
+                logger.info(f"Created DataRoom node in Neo4j: {dr.id}")
+            except Exception as e:
+                logger.warning(f"Failed to create DataRoom node in Neo4j: {e}")
+
             self._update_list()
 
             # Select the new data room
@@ -264,11 +277,26 @@ class DataRoomListWidget(QWidget):
             )
 
             if reply == QMessageBox.Yes:
+                # Delete from Neo4j first
+                try:
+                    neo4j = get_neo4j_client()
+                    deleted_counts = neo4j.delete_dataroom(dataroom_id)
+                    total_deleted = sum(deleted_counts.values())
+                    logger.info(f"Deleted {total_deleted} nodes from Neo4j for dataroom {dataroom_id}: {deleted_counts}")
+                except Exception as e:
+                    logger.error(f"Error deleting dataroom from Neo4j: {e}")
+                    QMessageBox.warning(
+                        self,
+                        "Warning",
+                        f"Failed to delete data from Neo4j database:\n{e}\n\n"
+                        "The data room will be removed from the list but data may remain in the database.",
+                    )
+
+                # Remove from local storage
                 del self._datarooms[dataroom_id]
                 self._save_datarooms()
                 self._update_list()
 
-                # TODO: Delete from Neo4j
                 logger.info(f"Deleted data room: {dataroom_id}")
 
     def refresh(self):

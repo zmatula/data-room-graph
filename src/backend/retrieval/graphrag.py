@@ -24,6 +24,7 @@ class RetrievalResult:
     document_path: str
     document_name: str
     page: Optional[int] = None
+    section_title: Optional[str] = None
     entities: list[str] = field(default_factory=list)
     parent_context: Optional[str] = None
     sibling_context: Optional[str] = None
@@ -138,21 +139,22 @@ class GraphRAGRetriever:
             List of retrieval results.
         """
         # Build query with optional doc type filter using parameterized query
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         CALL db.index.vector.queryNodes('chunk_embedding', $top_k, $embedding)
         YIELD node AS chunk, score
         WHERE chunk.dataroom_id = $dataroom_id
-        MATCH (chunk)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        MATCH (chunk)<-[:CONTAINS]-(section:Section)
+        MATCH (chunk)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
         WHERE CASE WHEN $doc_types IS NOT NULL THEN doc.doc_type IN $doc_types ELSE true END
-        OPTIONAL MATCH (chunk)<-[:CONTAINS]-(parent:Chunk)
         RETURN chunk.id AS chunk_id,
                chunk.text AS text,
                score,
                doc.id AS document_id,
                doc.full_path AS document_path,
                doc.filename AS document_name,
-               chunk.page_start AS page,
-               parent.text AS parent_context
+               page.page_number AS page,
+               section.title AS section_title
         ORDER BY score DESC
         LIMIT $top_k
         """
@@ -176,7 +178,7 @@ class GraphRAGRetriever:
                 document_path=r["document_path"],
                 document_name=r["document_name"],
                 page=r.get("page"),
-                parent_context=r.get("parent_context"),
+                section_title=r.get("section_title"),
                 source="vector",
             )
             for r in results
@@ -201,11 +203,13 @@ class GraphRAGRetriever:
             List of retrieval results.
         """
         # Build query with optional doc type filter using parameterized query
+        # Hierarchy: Document -> Page -> Section -> Chunk
         cypher_query = """
         CALL db.index.fulltext.queryNodes('chunk_content', $query)
         YIELD node AS chunk, score
         WHERE chunk.dataroom_id = $dataroom_id
-        MATCH (chunk)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        MATCH (chunk)<-[:CONTAINS]-(section:Section)
+        MATCH (chunk)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
         WHERE CASE WHEN $doc_types IS NOT NULL THEN doc.doc_type IN $doc_types ELSE true END
         RETURN chunk.id AS chunk_id,
                chunk.text AS text,
@@ -213,7 +217,8 @@ class GraphRAGRetriever:
                doc.id AS document_id,
                doc.full_path AS document_path,
                doc.filename AS document_name,
-               chunk.page_start AS page
+               page.page_number AS page,
+               section.title AS section_title
         ORDER BY score DESC
         LIMIT $top_k
         """
@@ -233,6 +238,7 @@ class GraphRAGRetriever:
                     document_path=r["document_path"],
                     document_name=r["document_name"],
                     page=r.get("page"),
+                    section_title=r.get("section_title"),
                     source="fulltext",
                 )
                 for r in results
@@ -393,19 +399,22 @@ class GraphRAGRetriever:
         Returns:
             List of chunks mentioning the entity.
         """
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         MATCH (e:Entity {dataroom_id: $dataroom_id})
         WHERE (e.name CONTAINS $entity_name OR e.canonical_name CONTAINS $entity_name)
         AND CASE WHEN $entity_type IS NOT NULL THEN e.entity_type = $entity_type ELSE true END
         MATCH (c:Chunk)-[r:MENTIONS]->(e)
-        MATCH (c)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        MATCH (c)<-[:CONTAINS]-(section:Section)
+        MATCH (c)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
         RETURN DISTINCT c.id AS chunk_id,
                c.text AS text,
                r.confidence AS score,
                doc.id AS document_id,
                doc.full_path AS document_path,
                doc.filename AS document_name,
-               c.page_start AS page,
+               page.page_number AS page,
+               section.title AS section_title,
                collect(DISTINCT e.name) AS entities
         ORDER BY score DESC
         LIMIT $top_k
@@ -425,6 +434,7 @@ class GraphRAGRetriever:
                 document_path=r["document_path"],
                 document_name=r["document_name"],
                 page=r.get("page"),
+                section_title=r.get("section_title"),
                 entities=r["entities"],
                 source="entity",
             )

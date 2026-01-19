@@ -27,8 +27,8 @@ class HierarchyExpander:
         """Expand a set of chunks by traversing the graph.
 
         Expansion includes:
-        - Sibling chunks (NEXT relationships)
-        - Parent chunks (CONTAINS relationship)
+        - Sibling chunks (NEXT relationships within section)
+        - Other chunks in the same section
         - Chunks mentioning the same entities
 
         Args:
@@ -41,22 +41,24 @@ class HierarchyExpander:
         if not chunk_ids:
             return []
 
-        # Query for siblings and parents using parameterized query
-        sibling_parent_query = """
+        # Query for siblings within section using parameterized query
+        # Hierarchy: Document -> Page -> Section -> Chunk
+        sibling_section_query = """
         MATCH (c:Chunk)
         WHERE c.id IN $chunk_ids
 
-        // Get siblings (chunks before and after)
+        // Get siblings (chunks before and after in sequence)
         OPTIONAL MATCH (c)-[:NEXT]->(next:Chunk)
         OPTIONAL MATCH (prev:Chunk)-[:NEXT]->(c)
 
-        // Get parent chunks
-        OPTIONAL MATCH (c)<-[:CONTAINS]-(parent:Chunk)
+        // Get other chunks in the same section
+        OPTIONAL MATCH (c)<-[:CONTAINS]-(section:Section)-[:CONTAINS]->(sibling:Chunk)
+        WHERE sibling.id <> c.id
 
-        // Get document info
-        MATCH (c)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        // Get document info via chunk's page
+        MATCH (c)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
 
-        WITH collect(DISTINCT next) + collect(DISTINCT prev) + collect(DISTINCT parent) AS expanded_chunks, doc
+        WITH collect(DISTINCT next) + collect(DISTINCT prev) + collect(DISTINCT sibling) AS expanded_chunks, doc, page
         UNWIND expanded_chunks AS exp
         WHERE exp IS NOT NULL
 
@@ -66,21 +68,23 @@ class HierarchyExpander:
                doc.id AS document_id,
                doc.full_path AS document_path,
                doc.filename AS document_name,
-               exp.page_start AS page,
-               'sibling_parent' AS expansion_type
+               page.page_number AS page,
+               'sibling_section' AS expansion_type
         LIMIT $max_expansion
         """
 
         # Query for chunks mentioning the same entities using parameterized query
+        # Hierarchy: Document -> Page -> Section -> Chunk
         entity_cooccurrence_query = """
         MATCH (c:Chunk)
         WHERE c.id IN $chunk_ids
         MATCH (c)-[:MENTIONS]->(e:Entity)
         MATCH (other:Chunk)-[:MENTIONS]->(e)
         WHERE NOT other.id IN $chunk_ids
-        MATCH (other)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        MATCH (other)<-[:CONTAINS]-(section:Section)
+        MATCH (other)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
 
-        WITH other, doc, count(DISTINCT e) AS shared_entities
+        WITH other, doc, page, count(DISTINCT e) AS shared_entities
         ORDER BY shared_entities DESC
 
         RETURN DISTINCT other.id AS chunk_id,
@@ -89,7 +93,7 @@ class HierarchyExpander:
                doc.id AS document_id,
                doc.full_path AS document_path,
                doc.filename AS document_name,
-               other.page_start AS page,
+               page.page_number AS page,
                'entity_cooccurrence' AS expansion_type
         LIMIT $max_expansion
         """
@@ -98,7 +102,7 @@ class HierarchyExpander:
 
         # Execute both queries
         sibling_results = self.neo4j.execute_read(
-            sibling_parent_query, {"chunk_ids": chunk_ids, "max_expansion": max_expansion // 2}
+            sibling_section_query, {"chunk_ids": chunk_ids, "max_expansion": max_expansion // 2}
         )
         entity_results = self.neo4j.execute_read(
             entity_cooccurrence_query, {"chunk_ids": chunk_ids, "max_expansion": max_expansion // 2}
@@ -135,6 +139,7 @@ class HierarchyExpander:
             context_window = 2  # Default to safe value
 
         # Note: Neo4j doesn't support parameterized relationship depths, so we use validated int
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = f"""
         MATCH (c:Chunk {{id: $chunk_id}})
 
@@ -144,18 +149,18 @@ class HierarchyExpander:
         // Get N next chunks
         OPTIONAL MATCH path_next = (c)-[:NEXT*1..{context_window}]->(next:Chunk)
 
-        // Get parent hierarchy
-        OPTIONAL MATCH (c)<-[:CONTAINS*]-(parent:Chunk)
+        // Get parent section
+        OPTIONAL MATCH (c)<-[:CONTAINS]-(section:Section)
 
-        // Get document
-        MATCH (c)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        // Get document via chunk's page
+        MATCH (c)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
 
         RETURN c.text AS text,
-               c.page_start AS page,
+               page.page_number AS page,
                c.element_type AS element_type,
                collect(DISTINCT prev.text) AS prev_texts,
                collect(DISTINCT next.text) AS next_texts,
-               collect(DISTINCT parent.text) AS parent_texts,
+               section.title AS section_title,
                doc.filename AS document_name,
                doc.full_path AS document_path
         """
@@ -176,7 +181,7 @@ class HierarchyExpander:
             "element_type": result.get("element_type"),
             "previous_context": result.get("prev_texts", []),
             "next_context": result.get("next_texts", []),
-            "parent_context": result.get("parent_texts", []),
+            "section_title": result.get("section_title"),
             "document_name": result["document_name"],
             "document_path": result["document_path"],
         }
@@ -193,22 +198,25 @@ class HierarchyExpander:
         Returns:
             List of chunks in the same section.
         """
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         MATCH (c:Chunk {id: $chunk_id})
 
-        // Find the parent section (Title element)
-        OPTIONAL MATCH (c)<-[:CONTAINS*]-(section:Chunk {element_type: 'Title'})
+        // Find the parent section
+        MATCH (c)<-[:CONTAINS]-(section:Section)
 
         // Get all chunks under this section
-        MATCH (section)-[:CONTAINS*]->(sibling:Chunk)
-        MATCH (sibling)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        MATCH (section)-[:CONTAINS]->(sibling:Chunk)
+        MATCH (sibling)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
 
         RETURN sibling.id AS chunk_id,
                sibling.text AS text,
                sibling.sequence_order AS sequence_order,
                sibling.element_type AS element_type,
-               doc.id AS document_id
-        ORDER BY sequence_order
+               doc.id AS document_id,
+               section.title AS section_title,
+               page.page_number AS page
+        ORDER BY sibling.sequence_order
         """
 
         results = self.neo4j.execute_read(query, {"chunk_id": chunk_id})
@@ -220,6 +228,8 @@ class HierarchyExpander:
                 "sequence_order": r["sequence_order"],
                 "element_type": r["element_type"],
                 "document_id": r["document_id"],
+                "section_title": r.get("section_title"),
+                "page": r.get("page"),
             }
             for r in results
         ]
@@ -238,13 +248,15 @@ class HierarchyExpander:
         Returns:
             List of related chunks with entity information.
         """
+        # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         MATCH (c:Chunk {id: $chunk_id})-[:MENTIONS]->(e:Entity)
         MATCH (other:Chunk)-[:MENTIONS]->(e)
         WHERE other.id <> $chunk_id
-        MATCH (other)<-[:HAS_ROOT|CONTAINS*]-(doc:Document)
+        MATCH (other)<-[:CONTAINS]-(section:Section)
+        MATCH (other)-[:ON_PAGE]->(page:Page)<-[:HAS_PAGE]-(doc:Document)
 
-        WITH other, doc, collect(DISTINCT e.name) AS shared_entities
+        WITH other, doc, section, page, collect(DISTINCT e.name) AS shared_entities
         ORDER BY size(shared_entities) DESC
 
         RETURN other.id AS chunk_id,
@@ -252,7 +264,8 @@ class HierarchyExpander:
                shared_entities,
                doc.filename AS document_name,
                doc.full_path AS document_path,
-               other.page_start AS page
+               page.page_number AS page,
+               section.title AS section_title
         LIMIT $max_results
         """
 
@@ -268,6 +281,7 @@ class HierarchyExpander:
                 "document_name": r["document_name"],
                 "document_path": r["document_path"],
                 "page": r.get("page"),
+                "section_title": r.get("section_title"),
             }
             for r in results
         ]

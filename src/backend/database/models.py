@@ -99,6 +99,7 @@ class Folder(BaseNode):
     path: str
     parent_folder_id: Optional[str] = None
     document_count: int = 0
+    narrative: Optional[str] = None  # Claude-generated narrative describing folder contents
 
     @classmethod
     def create(cls, dataroom_id: str, path: str, name: str, **kwargs) -> "Folder":
@@ -141,19 +142,74 @@ class Document(BaseNode):
         )
 
 
+class Page(BaseNode):
+    """A page within a document."""
+
+    dataroom_id: str
+    document_id: str
+    page_number: int
+
+    @classmethod
+    def create(cls, dataroom_id: str, document_id: str, page_number: int, **kwargs) -> "Page":
+        """Create a new Page with auto-generated ID."""
+        unique_content = f"{document_id}:page:{page_number}"
+        page_id = generate_id("page", dataroom_id, unique_content)
+        return cls(
+            id=page_id,
+            dataroom_id=dataroom_id,
+            document_id=document_id,
+            page_number=page_number,
+            **kwargs,
+        )
+
+
+class Section(BaseNode):
+    """A section within a document, derived from Title elements."""
+
+    dataroom_id: str
+    document_id: str
+    title: str
+    description: Optional[str] = None  # Claude-generated description for top-level sections
+    sequence_order: int = 0  # Order within the document
+    hierarchy_level: int = 0  # 0 = top-level, higher = nested
+    hierarchy_path: str = "0"  # Path from root like "0/1/3"
+    parent_section_id: Optional[str] = None
+    page_id: Optional[str] = None  # Primary page where section starts
+
+    @classmethod
+    def create(
+        cls,
+        dataroom_id: str,
+        document_id: str,
+        title: str,
+        hierarchy_path: str,
+        order: int,
+        **kwargs,
+    ) -> "Section":
+        """Create a new Section with auto-generated ID."""
+        unique_content = f"{document_id}:section:{hierarchy_path}:{order}:{title[:50]}"
+        section_id = generate_id("section", dataroom_id, unique_content)
+        return cls(
+            id=section_id,
+            dataroom_id=dataroom_id,
+            document_id=document_id,
+            title=title,
+            hierarchy_path=hierarchy_path,
+            sequence_order=order,
+            **kwargs,
+        )
+
+
 class Chunk(BaseNode):
     """A chunk of text from a document."""
 
     dataroom_id: str
     document_id: str
-    parent_chunk_id: Optional[str] = None
+    section_id: Optional[str] = None  # Parent section
+    page_id: Optional[str] = None  # Primary page where chunk appears
     text: str
     element_type: str = "NarrativeText"  # Title, NarrativeText, ListItem, Table, etc.
-    hierarchy_level: int = 0  # 0 = root section, higher = nested
-    hierarchy_path: str = "0"  # Path from root like "0/1/3"
-    sequence_order: int = 0  # Order within parent
-    page_start: Optional[int] = None
-    page_end: Optional[int] = None
+    sequence_order: int = 0  # Order within section
     offset_start: int = 0
     offset_end: int = 0
     coordinates: Optional[dict] = None  # {x, y, width, height}
@@ -166,19 +222,18 @@ class Chunk(BaseNode):
         dataroom_id: str,
         document_id: str,
         text: str,
-        hierarchy_path: str,
         order: int,
         **kwargs,
     ) -> "Chunk":
         """Create a new Chunk with auto-generated ID."""
-        unique_content = f"{document_id}:{hierarchy_path}:{order}:{text[:100]}"
+        section_id = kwargs.get("section_id", "")
+        unique_content = f"{document_id}:{section_id}:{order}:{text[:100]}"
         chunk_id = generate_id("chunk", dataroom_id, unique_content)
         return cls(
             id=chunk_id,
             dataroom_id=dataroom_id,
             document_id=document_id,
             text=text,
-            hierarchy_path=hierarchy_path,
             sequence_order=order,
             **kwargs,
         )

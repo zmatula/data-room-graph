@@ -10,11 +10,13 @@ from typing import Optional, Callable
 from dataclasses import dataclass, field
 
 from .unstructured import UnstructuredClient
-from .chunker import HierarchyBuilder
+from .chunker import SectionChunkBuilder, SectionNode
+from .page_builder import PageBuilder
+from .narrative_generator import NarrativeGenerator
 from .classifier import DocumentClassifier
 from .embedder import Embedder, get_embedder
 from ..database.neo4j_client import Neo4jClient, get_neo4j_client
-from ..database.models import DataRoom, Folder, Document, Chunk
+from ..database.models import DataRoom, Folder, Document, Page, Section, Chunk
 from ..extraction.linker import EntityLinker
 from ..config import get_settings
 
@@ -30,10 +32,14 @@ class IngestionProgress:
     total_chunks: int = 0
     processed_chunks: int = 0
     current_file: str = ""
-    status: str = "pending"  # pending, running, completed, failed
+    status: str = "pending"  # pending, running, extracting_entities, completed, failed
     error_message: str = ""
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    # Entity extraction tracking
+    total_documents_for_extraction: int = 0
+    extracted_documents: int = 0
+    entities_found: int = 0
 
     @property
     def file_progress(self) -> float:
@@ -44,6 +50,11 @@ class IngestionProgress:
     def chunk_progress(self) -> float:
         """Get chunk processing progress (0-1)."""
         return self.processed_chunks / self.total_chunks if self.total_chunks > 0 else 0
+
+    @property
+    def extraction_progress(self) -> float:
+        """Get entity extraction progress (0-1)."""
+        return self.extracted_documents / self.total_documents_for_extraction if self.total_documents_for_extraction > 0 else 0
 
 
 @dataclass
@@ -69,6 +80,7 @@ class IngestionPipeline:
         embedder: Optional[Embedder] = None,
         max_concurrent_files: Optional[int] = None,
         extract_entities: bool = False,
+        generate_narratives: bool = True,
     ):
         """Initialize the pipeline.
 
@@ -78,6 +90,7 @@ class IngestionPipeline:
             embedder: Embedding generator.
             max_concurrent_files: Max files to process in parallel. Defaults to settings.
             extract_entities: Whether to extract entities after document processing.
+            generate_narratives: Whether to generate folder narratives and section descriptions.
         """
         settings = get_settings()
         self.neo4j = neo4j_client or get_neo4j_client()
@@ -86,9 +99,12 @@ class IngestionPipeline:
         )
         self.embedder = embedder or get_embedder()
         self.classifier = DocumentClassifier()
-        self.chunker = HierarchyBuilder()
+        self.section_builder = SectionChunkBuilder()
+        self.page_builder = PageBuilder()
+        self.narrative_generator = NarrativeGenerator() if generate_narratives else None
         self.max_concurrent_files = max_concurrent_files or settings.max_concurrent_files
         self.extract_entities = extract_entities
+        self.generate_narratives = generate_narratives
         self.entity_linker = EntityLinker(self.neo4j) if extract_entities else None
 
         self._progress = IngestionProgress()
@@ -156,6 +172,10 @@ class IngestionPipeline:
 
             # Create folder nodes
             await self._create_folder_nodes(dataroom_id, folder_path, files)
+
+            # Generate folder narratives if enabled
+            if self.generate_narratives and self.narrative_generator:
+                await self._generate_folder_narratives(dataroom_id, folder_path, files)
 
             # Process files in parallel with semaphore to limit concurrency
             semaphore = asyncio.Semaphore(self.max_concurrent_files)
@@ -344,6 +364,54 @@ class IngestionPipeline:
                     rel_type="HAS_ROOT",
                 )
 
+    async def _generate_folder_narratives(
+        self,
+        dataroom_id: str,
+        root_path: Path,
+        files: list[Path],
+    ):
+        """Generate narratives for all folders in the data room.
+
+        Args:
+            dataroom_id: Data room ID.
+            root_path: Root folder path.
+            files: List of files.
+        """
+        if not self.narrative_generator:
+            return
+
+        logger.info("Generating folder narratives...")
+        self._update_progress(current_file="Generating folder narratives...")
+
+        # Build file tree
+        file_tree = self.narrative_generator.build_file_tree(root_path, files)
+
+        # Get data room name
+        dr_result = self.neo4j.execute_read(
+            "MATCH (dr:DataRoom {id: $id}) RETURN dr.name as name",
+            {"id": dataroom_id}
+        )
+        dataroom_name = dr_result[0]["name"] if dr_result else "Data Room"
+
+        # Get all folders for this data room
+        folders_result = self.neo4j.execute_read(
+            "MATCH (f:Folder {dataroom_id: $dataroom_id}) RETURN f.id as id, f.path as path",
+            {"dataroom_id": dataroom_id}
+        )
+
+        for folder in folders_result or []:
+            narrative = self.narrative_generator.generate_folder_narrative(
+                folder["path"],
+                file_tree,
+                dataroom_name,
+            )
+
+            if narrative:
+                self.neo4j.execute_write(
+                    "MATCH (f:Folder {id: $id}) SET f.narrative = $narrative",
+                    {"id": folder["id"], "narrative": narrative}
+                )
+
     async def _process_document(
         self,
         dataroom_id: str,
@@ -404,54 +472,50 @@ class IngestionPipeline:
             rel_type="CONTAINS",
         )
 
-        # Create chunks
-        chunks = self.chunker.create_chunks(elements, dataroom_id, document.id)
+        # Build Pages
+        pages, page_id_map = self.page_builder.extract_pages(
+            elements, dataroom_id, document.id
+        )
+
+        # Build Sections
+        sections, section_nodes, section_page_map = self.section_builder.build_sections(
+            elements, dataroom_id, document.id, page_id_map
+        )
+
+        # Build Chunks
+        chunks = self.section_builder.build_chunks(
+            section_nodes, dataroom_id, document.id, page_id_map
+        )
+
+        # Generate section descriptions for top-level sections
+        if self.generate_narratives and self.narrative_generator:
+            for section, node in zip(sections, section_nodes):
+                if section.hierarchy_level == 0:
+                    content_preview = self.section_builder.get_section_content_preview(node)
+                    description = self.narrative_generator.generate_section_description(
+                        section.title,
+                        content_preview,
+                        str(doc_type.value) if hasattr(doc_type, 'value') else str(doc_type),
+                        file_path.name,
+                    )
+                    if description:
+                        section.description = description
+
+        # Save document graph
+        await self._save_document_graph(
+            document, pages, page_id_map, sections, section_page_map, chunks
+        )
 
         # Generate embeddings
         chunk_texts = [c.text for c in chunks]
         embeddings = await self.embedder.embed_texts(chunk_texts, show_progress=True)
 
-        # Update chunks with embeddings and save to Neo4j
+        # Update chunks with embeddings
         for chunk, embedding in zip(chunks, embeddings):
-            chunk.embedding = embedding
-
-            self.neo4j.create_node(
-                labels=["Chunk"],
-                properties=chunk.to_neo4j_properties(),
+            self.neo4j.execute_write(
+                "MATCH (c:Chunk {id: $id}) SET c.embedding = $embedding",
+                {"id": chunk.id, "embedding": embedding}
             )
-
-            # Create relationship to document
-            self.neo4j.create_relationship(
-                start_id=document.id,
-                start_label="Document",
-                end_id=chunk.id,
-                end_label="Chunk",
-                rel_type="HAS_ROOT" if not chunk.parent_chunk_id else "CONTAINS",
-            )
-
-            # Create parent-child relationship
-            if chunk.parent_chunk_id:
-                self.neo4j.create_relationship(
-                    start_id=chunk.parent_chunk_id,
-                    start_label="Chunk",
-                    end_id=chunk.id,
-                    end_label="Chunk",
-                    rel_type="CONTAINS",
-                )
-
-        # Create NEXT relationships between sibling chunks
-        sorted_chunks = sorted(chunks, key=lambda c: c.sequence_order)
-        for i in range(len(sorted_chunks) - 1):
-            current = sorted_chunks[i]
-            next_chunk = sorted_chunks[i + 1]
-            if current.parent_chunk_id == next_chunk.parent_chunk_id:
-                self.neo4j.create_relationship(
-                    start_id=current.id,
-                    start_label="Chunk",
-                    end_id=next_chunk.id,
-                    end_label="Chunk",
-                    rel_type="NEXT",
-                )
 
         # Update document status
         self.neo4j.execute_write(
@@ -459,13 +523,135 @@ class IngestionPipeline:
             MATCH (d:Document {id: $doc_id})
             SET d.ingestion_status = 'completed',
                 d.chunk_count = $chunk_count,
+                d.page_count = $page_count,
                 d.updated_at = datetime()
             """,
-            {"doc_id": document.id, "chunk_count": len(chunks)},
+            {"doc_id": document.id, "chunk_count": len(chunks), "page_count": len(pages)},
         )
 
-        logger.info(f"Created {len(chunks)} chunks for {file_path.name}")
+        logger.info(f"Created {len(chunks)} chunks, {len(sections)} sections, {len(pages)} pages for {file_path.name}")
         return chunks
+
+    async def _save_document_graph(
+        self,
+        document: Document,
+        pages: list[Page],
+        page_id_map: dict[int, str],
+        sections: list[Section],
+        section_page_map: dict[str, set[str]],
+        chunks: list[Chunk],
+    ):
+        """Save the document graph structure to Neo4j.
+
+        Args:
+            document: Document model.
+            pages: List of Page models.
+            page_id_map: Mapping from page number to page ID.
+            sections: List of Section models.
+            section_page_map: Mapping from section ID to set of page IDs.
+            chunks: List of Chunk models.
+        """
+        # Save Page nodes with NEXT relationships
+        sorted_pages = sorted(pages, key=lambda p: p.page_number)
+        for i, page in enumerate(sorted_pages):
+            self.neo4j.create_node(
+                labels=["Page"],
+                properties=page.to_neo4j_properties(),
+            )
+
+            # Document -[HAS_PAGE]-> Page
+            self.neo4j.create_relationship(
+                start_id=document.id,
+                start_label="Document",
+                end_id=page.id,
+                end_label="Page",
+                rel_type="HAS_PAGE",
+            )
+
+            # Page -[NEXT]-> Page
+            if i > 0:
+                self.neo4j.create_relationship(
+                    start_id=sorted_pages[i - 1].id,
+                    start_label="Page",
+                    end_id=page.id,
+                    end_label="Page",
+                    rel_type="NEXT",
+                )
+
+        # Save Section nodes with relationships
+        for section in sections:
+            self.neo4j.create_node(
+                labels=["Section"],
+                properties=section.to_neo4j_properties(),
+            )
+
+            # Section -[CONTAINS]-> Section (nested sections)
+            if section.parent_section_id:
+                self.neo4j.create_relationship(
+                    start_id=section.parent_section_id,
+                    start_label="Section",
+                    end_id=section.id,
+                    end_label="Section",
+                    rel_type="CONTAINS",
+                )
+
+            # Page -[HAS_SECTION]-> Section (for each page the section spans)
+            page_ids = section_page_map.get(section.id, set())
+            for page_id in page_ids:
+                self.neo4j.create_relationship(
+                    start_id=page_id,
+                    start_label="Page",
+                    end_id=section.id,
+                    end_label="Section",
+                    rel_type="HAS_SECTION",
+                )
+
+        # Save Chunk nodes with relationships
+        chunks_by_section: dict[Optional[str], list[Chunk]] = {}
+        for chunk in chunks:
+            section_id = chunk.section_id
+            if section_id not in chunks_by_section:
+                chunks_by_section[section_id] = []
+            chunks_by_section[section_id].append(chunk)
+
+        for section_id, section_chunks in chunks_by_section.items():
+            sorted_chunks = sorted(section_chunks, key=lambda c: c.sequence_order)
+
+            for i, chunk in enumerate(sorted_chunks):
+                self.neo4j.create_node(
+                    labels=["Chunk"],
+                    properties=chunk.to_neo4j_properties(),
+                )
+
+                # Section -[CONTAINS]-> Chunk
+                if section_id:
+                    self.neo4j.create_relationship(
+                        start_id=section_id,
+                        start_label="Section",
+                        end_id=chunk.id,
+                        end_label="Chunk",
+                        rel_type="CONTAINS",
+                    )
+
+                # Chunk -[ON_PAGE]-> Page
+                if chunk.page_id:
+                    self.neo4j.create_relationship(
+                        start_id=chunk.id,
+                        start_label="Chunk",
+                        end_id=chunk.page_id,
+                        end_label="Page",
+                        rel_type="ON_PAGE",
+                    )
+
+                # Chunk -[NEXT]-> Chunk (within same section)
+                if i > 0:
+                    self.neo4j.create_relationship(
+                        start_id=sorted_chunks[i - 1].id,
+                        start_label="Chunk",
+                        end_id=chunk.id,
+                        end_label="Chunk",
+                        rel_type="NEXT",
+                    )
 
     def _compute_file_hash(self, file_path: Path) -> str:
         """Compute SHA-256 hash of file contents.
@@ -556,7 +742,6 @@ class IngestionPipeline:
             return 0
 
         logger.info(f"Starting entity extraction for data room {dataroom_id}")
-        self._update_progress(current_file="Extracting entities...")
 
         # Get all successfully processed documents
         docs_result = self.neo4j.execute_read(
@@ -568,6 +753,14 @@ class IngestionPipeline:
             {"dataroom_id": dataroom_id},
         )
 
+        total_docs = len(docs_result) if docs_result else 0
+        self._update_progress(
+            current_file="Extracting entities...",
+            total_documents_for_extraction=total_docs,
+            extracted_documents=0,
+            entities_found=0,
+        )
+
         total_entities = 0
         for i, doc in enumerate(docs_result or []):
             doc_id = doc["doc_id"]
@@ -575,18 +768,24 @@ class IngestionPipeline:
 
             try:
                 self._update_progress(
-                    current_file=f"Extracting entities: {filename} ({i+1}/{len(docs_result)})"
+                    current_file=f"Extracting entities: {filename} ({i+1}/{total_docs})",
+                    extracted_documents=i,
                 )
                 entities_count = self.entity_linker.process_document_chunks(
                     doc_id, dataroom_id
                 )
                 total_entities += entities_count
+                self._update_progress(
+                    entities_found=total_entities,
+                    extracted_documents=i + 1,
+                )
                 logger.info(f"Extracted {entities_count} entities from {filename}")
 
             except Exception as e:
                 error_msg = f"Entity extraction failed for {filename}: {e}"
                 logger.error(error_msg)
                 errors.append(error_msg)
+                self._update_progress(extracted_documents=i + 1)
 
         # Create entity relationships based on co-occurrence
         if total_entities > 0:
