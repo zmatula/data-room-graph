@@ -40,6 +40,9 @@ env/
 
 # Neo4j
 neo4j-data/
+neo4j_server/*.zip
+neo4j_server/jdk-*/
+neo4j_server/neo4j-community-*/
 
 # Logs
 *.log
