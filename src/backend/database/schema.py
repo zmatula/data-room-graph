@@ -22,6 +22,9 @@ NODE_CONSTRAINTS = [
     ("vehicle_id", "Vehicle", "id"),
     ("serviceprovider_id", "ServiceProvider", "id"),
     ("investor_id", "Investor", "id"),
+    ("portfoliocompany_id", "PortfolioCompany", "id"),
+    ("location_id", "Location", "id"),
+    ("asset_id", "Asset", "id"),
 ]
 
 # Vector index definitions: (name, label, property, dimensions, similarity)

@@ -51,6 +51,7 @@ class CanonicalMatch:
     canonical_name: str
     similarity: float
     is_new: bool
+    existing_type: Optional[EntityType] = None  # Type of existing entity if cross-type match
 
 
 class EntityCanonicalizer:
@@ -180,12 +181,98 @@ class EntityCanonicalizer:
 
         return None
 
+    def find_cross_type_match(
+        self,
+        name: str,
+        exclude_type: EntityType,
+        dataroom_id: str,
+    ) -> Optional[CanonicalMatch]:
+        """Find an existing entity that matches this name across ALL entity types.
+
+        This prevents duplicate entities when the same entity is classified
+        differently (e.g., "EnCap Investments LP" as both Fund and Manager).
+
+        Args:
+            name: Entity name to match.
+            exclude_type: Entity type to exclude (already checked by find_canonical_match).
+            dataroom_id: Data room to search in.
+
+        Returns:
+            CanonicalMatch if found, None otherwise.
+        """
+        # Get existing entities of ALL types except the one already checked
+        query = """
+        MATCH (e:Entity {dataroom_id: $dataroom_id})
+        WHERE e.entity_type <> $exclude_type
+        RETURN e.id as id, e.canonical_name as canonical_name, e.aliases as aliases, e.entity_type as entity_type
+        """
+        results = self.neo4j.execute_read(
+            query,
+            {
+                "dataroom_id": dataroom_id,
+                "exclude_type": exclude_type.value,
+            },
+        )
+
+        best_match: Optional[CanonicalMatch] = None
+        best_similarity = 0.0
+
+        for record in results:
+            canonical_name = record["canonical_name"]
+            aliases = record.get("aliases", []) or []
+
+            # Check canonical name
+            similarity = self.compute_similarity(name, canonical_name)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                # Map entity_type string back to EntityType enum
+                existing_type = None
+                try:
+                    existing_type = EntityType(record["entity_type"])
+                except ValueError:
+                    pass
+                best_match = CanonicalMatch(
+                    canonical_id=record["id"],
+                    canonical_name=canonical_name,
+                    similarity=similarity,
+                    is_new=False,
+                    existing_type=existing_type,
+                )
+
+            # Check aliases
+            for alias in aliases:
+                similarity = self.compute_similarity(name, alias)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    existing_type = None
+                    try:
+                        existing_type = EntityType(record["entity_type"])
+                    except ValueError:
+                        pass
+                    best_match = CanonicalMatch(
+                        canonical_id=record["id"],
+                        canonical_name=canonical_name,
+                        similarity=similarity,
+                        is_new=False,
+                        existing_type=existing_type,
+                    )
+
+        # Return match only if above threshold
+        if best_match and best_match.similarity >= self.similarity_threshold:
+            return best_match
+
+        return None
+
     def canonicalize_entity(
         self,
         entity: Entity,
         dataroom_id: str,
     ) -> tuple[str, bool]:
         """Canonicalize an entity, finding or creating a canonical version.
+
+        This method first checks for same-type matches (fast path), then
+        checks for cross-type duplicates to prevent the same entity from
+        being created with different types.
 
         Args:
             entity: Entity to canonicalize.
@@ -194,7 +281,7 @@ class EntityCanonicalizer:
         Returns:
             Tuple of (canonical_id, is_new).
         """
-        # Try to find existing match
+        # Fast path: try to find existing match of the same type
         match = self.find_canonical_match(
             entity.name,
             entity.entity_type,
@@ -206,6 +293,26 @@ class EntityCanonicalizer:
             if entity.name.lower() != match.canonical_name.lower():
                 self._add_alias(match.canonical_id, entity.name)
             return match.canonical_id, False
+
+        # Check for cross-type duplicates (same entity with different type)
+        cross_type_match = self.find_cross_type_match(
+            entity.name,
+            entity.entity_type,
+            dataroom_id,
+        )
+
+        if cross_type_match:
+            # Found existing entity with different type - link to it instead of creating duplicate
+            logger.warning(
+                f"Cross-type match: '{entity.name}' (new type: {entity.entity_type.value}) "
+                f"matches existing entity '{cross_type_match.canonical_name}' "
+                f"(type: {cross_type_match.existing_type.value if cross_type_match.existing_type else 'unknown'}). "
+                f"Linking to existing entity."
+            )
+            # Update alias list
+            if entity.name.lower() != cross_type_match.canonical_name.lower():
+                self._add_alias(cross_type_match.canonical_id, entity.name)
+            return cross_type_match.canonical_id, False
 
         # No match found - this is a new canonical entity
         entity.canonical_name = self._select_canonical_form(entity.name)

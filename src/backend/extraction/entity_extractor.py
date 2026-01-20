@@ -10,7 +10,10 @@ import anthropic
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from ..config import get_settings
-from ..database.models import EntityType, Entity, Fund, Manager, Person, Vehicle, ServiceProvider, Investor, generate_id
+from ..database.models import (
+    EntityType, Entity, Fund, Manager, Person, Vehicle, ServiceProvider, Investor,
+    PortfolioCompany, Location, Asset, generate_id, generate_entity_id
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,32 +31,82 @@ class ExtractedEntity:
     attributes: dict[str, Any] = field(default_factory=dict)
 
 
-# Extraction prompt template
-EXTRACTION_PROMPT = """You are an expert at extracting structured entities from private equity fund documents.
+# Extraction prompt template with PE-domain-specific definitions
+EXTRACTION_PROMPT = """You are an expert at extracting structured entities from private equity fund documents, specifically energy and natural resources focused PE funds.
 
 Extract all entities from the following text. For each entity, provide:
 - name: The entity's name as it appears in the text
-- type: One of: Fund, Manager, Person, Vehicle, ServiceProvider, Investor
+- type: One of the entity types defined below
 - confidence: Your confidence in this extraction (0.0-1.0)
 - context: The sentence or phrase containing the entity
 - attributes: Any relevant attributes mentioned
 
-Entity type definitions:
-- Fund: A private equity fund (e.g., "Acme Capital Fund IV", "XYZ Partners Fund II LP")
-- Manager: The fund manager or GP (e.g., "Acme Capital Management LLC", "XYZ Partners GP")
-- Person: An individual (e.g., "John Smith", "Jane Doe, Partner")
-- Vehicle: Legal entities like SPVs, feeders, blockers (e.g., "Acme Feeder LP", "XYZ Blocker LLC")
-- ServiceProvider: Auditors, administrators, counsel, custodians (e.g., "Deloitte LLP", "Morgan Lewis")
-- Investor: Limited partners or investors (e.g., "CalPERS", "Harvard Endowment")
+{context_section}
 
-Important guidelines:
-1. Be precise - only extract entities that are clearly identifiable
-2. Include confidence scores - use lower scores for ambiguous cases
-3. Capture context - include enough surrounding text for verification
-4. Extract attributes when present (e.g., vintage year, AUM, title/role)
-5. Don't extract generic terms that aren't specific entities
+=== ENTITY TYPE DEFINITIONS ===
 
-Text to analyze:
+FUND - The investment fund vehicle itself
+  Indicators: "Fund" in name, roman numerals (I, II, XII), vintage years, "LP" suffix
+  Examples: "EnCap Fund XII", "Apollo Investment Fund IX LP", "Blackstone Energy Partners III"
+  NOT the management company that runs the fund
+
+MANAGER - The fund manager, general partner, or management company
+  Indicators: "Management", "GP", "Advisors", "Capital" (when referring to the firm), "Partners" (the company)
+  Examples: "EnCap Investments LP", "Apollo Global Management", "Blackstone Group"
+  This is the firm that manages funds, NOT the fund itself
+
+PORTFOLIO_COMPANY - Companies that funds invest in or have invested in
+  Context: investments, acquisitions, portfolio holdings, "backed by", exits
+  Examples: "Double Eagle Energy", "Grayson Mill Energy", "Centennial Resource Development"
+  Often appear in tables listing "Portfolio Companies" or "Investments"
+
+LOCATION - Geographic areas relevant to investments
+  Types: Oil/gas basins, shale formations, regions, countries, states
+  Examples: "Permian Basin", "Bakken Formation", "Eagle Ford Shale", "Gulf Coast", "Midland Basin"
+  NOT a company - these are geographic/geological areas
+
+ASSET - Specific named physical assets or infrastructure
+  Types: Wells, properties, facilities, gathering systems, pipelines
+  Examples: "Well #123", "Eagle Ford Gathering System", "Delaware Basin Midstream"
+  Only extract if specifically named with identifiers or clear asset designation
+
+PERSON - An individual with a name
+  Examples: "John Smith", "Jane Doe, Partner", "David Miller, CEO"
+  Extract title/role if mentioned
+
+VEHICLE - Legal investment structures and special purpose entities
+  Types: SPVs, feeders, blockers, aggregator vehicles
+  Examples: "Acme Feeder LP", "XYZ Blocker LLC", "Delaware Aggregator"
+  NOT the main fund - these are subsidiary investment structures
+
+SERVICE_PROVIDER - Third-party service providers to the fund
+  Types: Auditors, administrators, legal counsel, custodians, placement agents
+  Examples: "Deloitte LLP", "Morgan Lewis", "State Street", "Citco Fund Services"
+
+INVESTOR - Limited partners or investors in the fund
+  Types: Pension funds, endowments, family offices, sovereign wealth funds
+  Examples: "CalPERS", "Harvard Endowment", "Texas Teachers Retirement"
+
+=== DISAMBIGUATION RULES ===
+
+1. MANAGER vs FUND:
+   - "EnCap Investments LP" = MANAGER (manages funds)
+   - "EnCap Fund XII" = FUND (the investment vehicle)
+   - If "X Capital" manages funds, it's MANAGER. If "X Fund" is the vehicle, it's FUND.
+
+2. PORTFOLIO_COMPANY vs FUND:
+   - Companies appearing under "Portfolio Companies", "Investments", or "Holdings" = PORTFOLIO_COMPANY
+   - Names like "Grayson Mill", "Double Eagle" without "Fund" = likely PORTFOLIO_COMPANY
+   - Check context: is this something the fund invests IN, or is it the fund itself?
+
+3. LOCATION vs MANAGER/COMPANY:
+   - "Bakken", "Permian", "Eagle Ford" = LOCATION (geographic basins)
+   - These are geographic formations, not companies
+   - Common basins: Permian, Bakken, Eagle Ford, Marcellus, Utica, DJ Basin, Haynesville
+
+4. When uncertain, use lower confidence scores and check the surrounding context carefully.
+
+=== TEXT TO ANALYZE ===
 ```
 {text}
 ```
@@ -116,12 +169,18 @@ class EntityExtractor:
         self,
         text: str,
         chunk_offset: int = 0,
+        doc_type: Optional[str] = None,
+        section_title: Optional[str] = None,
+        element_type: Optional[str] = None,
     ) -> list[ExtractedEntity]:
         """Extract entities from text.
 
         Args:
             text: Text to extract entities from.
             chunk_offset: Offset of this chunk in the document.
+            doc_type: Type of document (e.g., "LPA", "Quarterly report").
+            section_title: Title of the section containing this text.
+            element_type: Element type (e.g., "Table", "NarrativeText").
 
         Returns:
             List of extracted entities.
@@ -134,7 +193,21 @@ class EntityExtractor:
         if len(text) > max_chars:
             text = text[:max_chars]
 
-        prompt = EXTRACTION_PROMPT.format(text=text)
+        # Build context section for the prompt
+        context_parts = []
+        if doc_type:
+            context_parts.append(f"Document Type: {doc_type}")
+        if section_title:
+            context_parts.append(f"Section: {section_title}")
+        if element_type:
+            context_parts.append(f"Element Type: {element_type}")
+
+        if context_parts:
+            context_section = "=== DOCUMENT CONTEXT ===\n" + "\n".join(context_parts) + "\n"
+        else:
+            context_section = ""
+
+        prompt = EXTRACTION_PROMPT.format(text=text, context_section=context_section)
 
         try:
             response = self.client.messages.create(
@@ -232,24 +305,50 @@ class EntityExtractor:
             EntityType or None if invalid.
         """
         type_mapping = {
+            # Fund types
             "fund": EntityType.FUND,
+            # Manager types
             "manager": EntityType.MANAGER,
             "gp": EntityType.MANAGER,
             "general partner": EntityType.MANAGER,
+            "management company": EntityType.MANAGER,
+            # Person types
             "person": EntityType.PERSON,
             "individual": EntityType.PERSON,
+            # Vehicle types
             "vehicle": EntityType.VEHICLE,
             "spv": EntityType.VEHICLE,
             "feeder": EntityType.VEHICLE,
             "blocker": EntityType.VEHICLE,
+            # Service provider types
             "serviceprovider": EntityType.SERVICE_PROVIDER,
             "service provider": EntityType.SERVICE_PROVIDER,
+            "service_provider": EntityType.SERVICE_PROVIDER,
             "auditor": EntityType.SERVICE_PROVIDER,
             "administrator": EntityType.SERVICE_PROVIDER,
             "counsel": EntityType.SERVICE_PROVIDER,
+            # Investor types
             "investor": EntityType.INVESTOR,
             "lp": EntityType.INVESTOR,
             "limited partner": EntityType.INVESTOR,
+            # Portfolio company types
+            "portfolio_company": EntityType.PORTFOLIO_COMPANY,
+            "portfoliocompany": EntityType.PORTFOLIO_COMPANY,
+            "portfolio company": EntityType.PORTFOLIO_COMPANY,
+            "company": EntityType.PORTFOLIO_COMPANY,
+            "portco": EntityType.PORTFOLIO_COMPANY,
+            # Location types
+            "location": EntityType.LOCATION,
+            "geography": EntityType.LOCATION,
+            "basin": EntityType.LOCATION,
+            "region": EntityType.LOCATION,
+            "formation": EntityType.LOCATION,
+            # Asset types
+            "asset": EntityType.ASSET,
+            "property": EntityType.ASSET,
+            "well": EntityType.ASSET,
+            "facility": EntityType.ASSET,
+            "infrastructure": EntityType.ASSET,
         }
         return type_mapping.get(type_str.lower().strip())
 
@@ -314,12 +413,9 @@ class EntityExtractor:
         Returns:
             Entity model instance.
         """
-        # Generate deterministic ID for the entity
-        entity_id = generate_id(
-            extracted.entity_type.value.lower(),
-            dataroom_id,
-            extracted.name.lower()
-        )
+        # Generate type-independent ID based on canonical name
+        # This prevents duplicate entities when type classification changes
+        entity_id = generate_entity_id(dataroom_id, extracted.name)
 
         base_kwargs = {
             "id": entity_id,
@@ -370,6 +466,26 @@ class EntityExtractor:
                 **base_kwargs,
                 investor_type=extracted.attributes.get("investor_type"),
                 commitment_amount=extracted.attributes.get("commitment_amount"),
+            )
+        elif extracted.entity_type == EntityType.PORTFOLIO_COMPANY:
+            return PortfolioCompany(
+                **base_kwargs,
+                industry=extracted.attributes.get("industry"),
+                ownership_pct=extracted.attributes.get("ownership_pct"),
+                investment_date=extracted.attributes.get("investment_date"),
+                exit_date=extracted.attributes.get("exit_date"),
+            )
+        elif extracted.entity_type == EntityType.LOCATION:
+            return Location(
+                **base_kwargs,
+                location_type=extracted.attributes.get("location_type"),
+                parent_location=extracted.attributes.get("parent_location"),
+            )
+        elif extracted.entity_type == EntityType.ASSET:
+            return Asset(
+                **base_kwargs,
+                asset_type=extracted.attributes.get("asset_type"),
+                location_id=extracted.attributes.get("location_id"),
             )
         else:
             return Entity.create(

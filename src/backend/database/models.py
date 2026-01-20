@@ -34,6 +34,9 @@ class EntityType(str, Enum):
     VEHICLE = "Vehicle"
     SERVICE_PROVIDER = "ServiceProvider"
     INVESTOR = "Investor"
+    PORTFOLIO_COMPANY = "PortfolioCompany"
+    LOCATION = "Location"
+    ASSET = "Asset"
 
 
 def generate_id(node_type: str, data_room_id: str, unique_content: str) -> str:
@@ -49,6 +52,24 @@ def generate_id(node_type: str, data_room_id: str, unique_content: str) -> str:
     """
     content_hash = hashlib.sha256(unique_content.encode()).hexdigest()[:12]
     return f"{node_type}:{data_room_id}:{content_hash}"
+
+
+def generate_entity_id(data_room_id: str, canonical_name: str) -> str:
+    """Generate a type-independent entity ID based on canonical name.
+
+    This ensures the same entity keeps the same ID even if its type changes,
+    preventing duplicate entities when type classification is corrected.
+
+    Args:
+        data_room_id: ID of the containing data room.
+        canonical_name: Canonical name of the entity.
+
+    Returns:
+        Formatted ID string: entity:{data_room_id}:{hash}
+    """
+    normalized = canonical_name.lower().strip()
+    content_hash = hashlib.sha256(normalized.encode()).hexdigest()[:12]
+    return f"entity:{data_room_id}:{content_hash}"
 
 
 class BaseNode(BaseModel):
@@ -340,6 +361,41 @@ class Investor(Entity):
 
     def __init__(self, **data):
         data["entity_type"] = EntityType.INVESTOR
+        super().__init__(**data)
+
+
+class PortfolioCompany(Entity):
+    """A portfolio company that funds invest in."""
+
+    industry: Optional[str] = None
+    ownership_pct: Optional[float] = None
+    investment_date: Optional[str] = None
+    exit_date: Optional[str] = None
+
+    def __init__(self, **data):
+        data["entity_type"] = EntityType.PORTFOLIO_COMPANY
+        super().__init__(**data)
+
+
+class Location(Entity):
+    """A geographic location relevant to investments."""
+
+    location_type: Optional[str] = None  # basin, region, country, state
+    parent_location: Optional[str] = None
+
+    def __init__(self, **data):
+        data["entity_type"] = EntityType.LOCATION
+        super().__init__(**data)
+
+
+class Asset(Entity):
+    """A specific named physical asset."""
+
+    asset_type: Optional[str] = None  # well, property, facility, gathering system
+    location_id: Optional[str] = None
+
+    def __init__(self, **data):
+        data["entity_type"] = EntityType.ASSET
         super().__init__(**data)
 
 

@@ -48,20 +48,29 @@ class EntityLinker:
         self,
         chunk: Chunk,
         dataroom_id: str,
+        doc_type: Optional[str] = None,
+        section_title: Optional[str] = None,
+        element_type: Optional[str] = None,
     ) -> list[MentionLink]:
         """Extract entities from a chunk and create mention links.
 
         Args:
             chunk: Chunk to process.
             dataroom_id: Data room ID.
+            doc_type: Type of document (e.g., "LPA", "Quarterly report").
+            section_title: Title of the section containing this chunk.
+            element_type: Element type (e.g., "Table", "NarrativeText").
 
         Returns:
             List of created mention links.
         """
-        # Extract entities from chunk text
+        # Extract entities from chunk text with context
         extracted = self.extractor.extract_entities(
             chunk.text,
             chunk.offset_start,
+            doc_type=doc_type,
+            section_title=section_title,
+            element_type=element_type or chunk.element_type,
         )
 
         links = []
@@ -215,11 +224,19 @@ class EntityLinker:
         Returns:
             Number of entities linked.
         """
-        # Get all chunks for document
+        # Get all chunks for document with section and document context
         # Hierarchy: Document -> Page -> Section -> Chunk
         query = """
         MATCH (d:Document {id: $document_id})-[:HAS_PAGE]->(p:Page)-[:HAS_SECTION]->(s:Section)-[:CONTAINS]->(c:Chunk)
-        RETURN DISTINCT c.id as id, c.text as text, c.offset_start as offset_start, c.offset_end as offset_end, c.sequence_order as seq
+        RETURN DISTINCT
+            c.id as id,
+            c.text as text,
+            c.offset_start as offset_start,
+            c.offset_end as offset_end,
+            c.sequence_order as seq,
+            c.element_type as element_type,
+            s.title as section_title,
+            d.doc_type as doc_type
         ORDER BY seq
         """
 
@@ -239,9 +256,17 @@ class EntityLinker:
                 text=chunk_data["text"],
                 offset_start=offset_start,
                 offset_end=offset_end,
+                element_type=chunk_data.get("element_type", "NarrativeText"),
             )
 
-            links = self.process_chunk(chunk, dataroom_id)
+            # Pass document context to improve classification
+            links = self.process_chunk(
+                chunk,
+                dataroom_id,
+                doc_type=chunk_data.get("doc_type"),
+                section_title=chunk_data.get("section_title"),
+                element_type=chunk_data.get("element_type"),
+            )
             total_links += len(links)
 
         logger.info(
