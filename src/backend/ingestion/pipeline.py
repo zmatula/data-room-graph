@@ -6,7 +6,7 @@ import hashlib
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional, Callable, Literal, Union
 from dataclasses import dataclass, field
 
 from .unstructured import UnstructuredClient
@@ -21,6 +21,10 @@ from ..extraction.linker import EntityLinker
 from ..config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+# Pipeline type for factory method
+PipelineType = Literal["legacy", "graphrag"]
 
 
 @dataclass
@@ -853,3 +857,49 @@ class IngestionPipeline:
     def shutdown(self):
         """Shutdown the pipeline and cleanup resources."""
         self.unstructured.shutdown()
+
+
+def create_pipeline(
+    pipeline_type: PipelineType = "legacy",
+    neo4j_client: Optional[Neo4jClient] = None,
+    extract_entities: bool = False,
+    generate_narratives: bool = True,
+    **kwargs,
+) -> Union["IngestionPipeline", "GraphRAGPipeline"]:
+    """Factory function to create an ingestion pipeline.
+
+    This function provides a unified way to create either the legacy
+    ingestion pipeline or the new GraphRAG-based pipeline.
+
+    Args:
+        pipeline_type: Type of pipeline to create:
+            - "legacy": Original pipeline with Unstructured.io + custom entity extraction
+            - "graphrag": New pipeline using neo4j-graphrag library
+        neo4j_client: Neo4j client instance.
+        extract_entities: Whether to extract entities (legacy only).
+        generate_narratives: Whether to generate folder/section narratives (legacy only).
+        **kwargs: Additional arguments passed to the pipeline constructor.
+
+    Returns:
+        Either IngestionPipeline or GraphRAGPipeline instance.
+
+    Raises:
+        ValueError: If pipeline_type is not recognized.
+    """
+    if pipeline_type == "legacy":
+        return IngestionPipeline(
+            neo4j_client=neo4j_client,
+            extract_entities=extract_entities,
+            generate_narratives=generate_narratives,
+            **kwargs,
+        )
+    elif pipeline_type == "graphrag":
+        # Import here to avoid circular imports and make graphrag optional
+        from .graphrag_pipeline import GraphRAGPipeline
+
+        return GraphRAGPipeline(
+            neo4j_client=neo4j_client,
+            **kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown pipeline type: {pipeline_type}. Use 'legacy' or 'graphrag'.")

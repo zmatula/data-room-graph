@@ -1,7 +1,15 @@
-"""GraphRAG hybrid retrieval implementation."""
+"""GraphRAG hybrid retrieval implementation.
+
+This module provides hybrid retrieval using vector similarity + graph traversal.
+It supports both:
+- Legacy structure: Document -> Page -> Section -> Chunk
+- GraphRAG structure: Document -> Chunk (with metadata properties)
+
+The retriever auto-detects which structure is in use and adjusts queries accordingly.
+"""
 
 import logging
-from typing import Optional
+from typing import Optional, Literal
 from dataclasses import dataclass, field
 
 from ..config import get_settings
@@ -11,6 +19,10 @@ from .hierarchy import HierarchyExpander
 from .citations import Citation, CitationResolver
 
 logger = logging.getLogger(__name__)
+
+
+# Schema type for query adaptation
+SchemaType = Literal["legacy", "graphrag", "auto"]
 
 
 @dataclass
@@ -42,23 +54,66 @@ class RetrievalResponse:
 
 
 class GraphRAGRetriever:
-    """Hybrid retrieval using vector similarity + graph traversal."""
+    """Hybrid retrieval using vector similarity + graph traversal.
+
+    This retriever supports both legacy and GraphRAG schema structures:
+    - Legacy: Document -> Page -> Section -> Chunk (with CONTAINS relationships)
+    - GraphRAG: Document -> Chunk (with FROM_DOCUMENT relationship and metadata properties)
+
+    The schema_type parameter controls which queries are used. Use "auto" to
+    detect the schema automatically based on the presence of Section nodes.
+    """
 
     def __init__(
         self,
         neo4j_client: Optional[Neo4jClient] = None,
         embedder: Optional[Embedder] = None,
+        schema_type: SchemaType = "auto",
     ):
         """Initialize the retriever.
 
         Args:
             neo4j_client: Neo4j client.
             embedder: Embedding generator.
+            schema_type: Schema type to use for queries:
+                - "legacy": Use Section-based traversal
+                - "graphrag": Use metadata-based queries
+                - "auto": Auto-detect based on graph structure
         """
         self.neo4j = neo4j_client or get_neo4j_client()
         self.embedder = embedder or get_embedder()
-        self.hierarchy_expander = HierarchyExpander(self.neo4j)
+        self.hierarchy_expander = HierarchyExpander(self.neo4j, schema_type=schema_type)
         self.citation_resolver = CitationResolver(self.neo4j)
+        self._schema_type = schema_type
+        self._detected_schema: Optional[SchemaType] = None
+
+    @property
+    def schema_type(self) -> SchemaType:
+        """Get the effective schema type (auto-detected if needed)."""
+        if self._schema_type != "auto":
+            return self._schema_type
+
+        if self._detected_schema is None:
+            self._detected_schema = self._detect_schema()
+
+        return self._detected_schema
+
+    def _detect_schema(self) -> SchemaType:
+        """Detect which schema is in use based on graph structure.
+
+        Returns:
+            Detected schema type.
+        """
+        # Check if Section nodes exist
+        query = "MATCH (s:Section) RETURN count(s) > 0 AS has_sections LIMIT 1"
+        result = self.neo4j.execute_read(query, {})
+
+        if result and result[0].get("has_sections"):
+            logger.debug("Auto-detected legacy schema (Section nodes present)")
+            return "legacy"
+
+        logger.debug("Auto-detected graphrag schema (no Section nodes)")
+        return "graphrag"
 
     async def retrieve(
         self,
@@ -138,8 +193,26 @@ class GraphRAGRetriever:
         Returns:
             List of retrieval results.
         """
-        # Build query with optional doc type filter using parameterized query
-        # Hierarchy: Document -> Page -> Section -> Chunk
+        if self.schema_type == "legacy":
+            return self._vector_search_legacy(
+                query_embedding, dataroom_id, top_k, doc_type_filter
+            )
+        else:
+            return self._vector_search_graphrag(
+                query_embedding, dataroom_id, top_k, doc_type_filter
+            )
+
+    def _vector_search_legacy(
+        self,
+        query_embedding: list[float],
+        dataroom_id: str,
+        top_k: int,
+        doc_type_filter: Optional[list[str]] = None,
+    ) -> list[RetrievalResult]:
+        """Vector search using legacy schema (Section-based).
+
+        Legacy hierarchy: Document -> Page -> Section -> Chunk
+        """
         query = """
         CALL db.index.vector.queryNodes('chunk_embedding', $top_k, $embedding)
         YIELD node AS chunk, score
@@ -155,6 +228,62 @@ class GraphRAGRetriever:
                doc.filename AS document_name,
                page.page_number AS page,
                section.title AS section_title
+        ORDER BY score DESC
+        LIMIT $top_k
+        """
+
+        results = self.neo4j.execute_read(
+            query,
+            {
+                "embedding": query_embedding,
+                "dataroom_id": dataroom_id,
+                "top_k": top_k,
+                "doc_types": doc_type_filter,
+            },
+        )
+
+        return [
+            RetrievalResult(
+                chunk_id=r["chunk_id"],
+                text=r["text"],
+                score=r["score"],
+                document_id=r["document_id"],
+                document_path=r["document_path"],
+                document_name=r["document_name"],
+                page=r.get("page"),
+                section_title=r.get("section_title"),
+                source="vector",
+            )
+            for r in results
+        ]
+
+    def _vector_search_graphrag(
+        self,
+        query_embedding: list[float],
+        dataroom_id: str,
+        top_k: int,
+        doc_type_filter: Optional[list[str]] = None,
+    ) -> list[RetrievalResult]:
+        """Vector search using GraphRAG schema (metadata-based).
+
+        GraphRAG structure: Document <- FROM_DOCUMENT - Chunk (with metadata properties)
+        Section info is stored as chunk.section_title and chunk.section_path properties.
+        """
+        query = """
+        CALL db.index.vector.queryNodes('chunk_embedding', $top_k, $embedding)
+        YIELD node AS chunk, score
+        WHERE chunk.dataroom_id = $dataroom_id
+        MATCH (chunk)-[:FROM_DOCUMENT]->(doc:Document)
+        WHERE CASE WHEN $doc_types IS NOT NULL THEN doc.doc_type IN $doc_types ELSE true END
+        RETURN chunk.id AS chunk_id,
+               chunk.text AS text,
+               score,
+               doc.id AS document_id,
+               doc.full_path AS document_path,
+               doc.filename AS document_name,
+               chunk.page_number AS page,
+               chunk.section_title AS section_title,
+               chunk.section_path AS section_path
         ORDER BY score DESC
         LIMIT $top_k
         """
@@ -202,8 +331,22 @@ class GraphRAGRetriever:
         Returns:
             List of retrieval results.
         """
-        # Build query with optional doc type filter using parameterized query
-        # Hierarchy: Document -> Page -> Section -> Chunk
+        if self.schema_type == "legacy":
+            return self._fulltext_search_legacy(query, dataroom_id, top_k, doc_type_filter)
+        else:
+            return self._fulltext_search_graphrag(query, dataroom_id, top_k, doc_type_filter)
+
+    def _fulltext_search_legacy(
+        self,
+        query: str,
+        dataroom_id: str,
+        top_k: int,
+        doc_type_filter: Optional[list[str]] = None,
+    ) -> list[RetrievalResult]:
+        """Fulltext search using legacy schema (Section-based).
+
+        Legacy hierarchy: Document -> Page -> Section -> Chunk
+        """
         cypher_query = """
         CALL db.index.fulltext.queryNodes('chunk_content', $query)
         YIELD node AS chunk, score
@@ -213,7 +356,7 @@ class GraphRAGRetriever:
         WHERE CASE WHEN $doc_types IS NOT NULL THEN doc.doc_type IN $doc_types ELSE true END
         RETURN chunk.id AS chunk_id,
                chunk.text AS text,
-               score * 0.8 AS score,  // Weight fulltext lower than vector
+               score * 0.8 AS score,
                doc.id AS document_id,
                doc.full_path AS document_path,
                doc.filename AS document_name,
@@ -244,7 +387,60 @@ class GraphRAGRetriever:
                 for r in results
             ]
         except Exception as e:
-            logger.warning(f"Fulltext search failed: {e}")
+            logger.warning(f"Fulltext search (legacy) failed: {e}")
+            return []
+
+    def _fulltext_search_graphrag(
+        self,
+        query: str,
+        dataroom_id: str,
+        top_k: int,
+        doc_type_filter: Optional[list[str]] = None,
+    ) -> list[RetrievalResult]:
+        """Fulltext search using GraphRAG schema (metadata-based).
+
+        GraphRAG structure: Document <- FROM_DOCUMENT - Chunk
+        """
+        cypher_query = """
+        CALL db.index.fulltext.queryNodes('chunk_content', $query)
+        YIELD node AS chunk, score
+        WHERE chunk.dataroom_id = $dataroom_id
+        MATCH (chunk)-[:FROM_DOCUMENT]->(doc:Document)
+        WHERE CASE WHEN $doc_types IS NOT NULL THEN doc.doc_type IN $doc_types ELSE true END
+        RETURN chunk.id AS chunk_id,
+               chunk.text AS text,
+               score * 0.8 AS score,
+               doc.id AS document_id,
+               doc.full_path AS document_path,
+               doc.filename AS document_name,
+               chunk.page_number AS page,
+               chunk.section_title AS section_title
+        ORDER BY score DESC
+        LIMIT $top_k
+        """
+
+        try:
+            results = self.neo4j.execute_read(
+                cypher_query,
+                {"query": query, "dataroom_id": dataroom_id, "top_k": top_k, "doc_types": doc_type_filter},
+            )
+
+            return [
+                RetrievalResult(
+                    chunk_id=r["chunk_id"],
+                    text=r["text"],
+                    score=r["score"],
+                    document_id=r["document_id"],
+                    document_path=r["document_path"],
+                    document_name=r["document_name"],
+                    page=r.get("page"),
+                    section_title=r.get("section_title"),
+                    source="fulltext",
+                )
+                for r in results
+            ]
+        except Exception as e:
+            logger.warning(f"Fulltext search (graphrag) failed: {e}")
             return []
 
     def _merge_results(
@@ -399,7 +595,23 @@ class GraphRAGRetriever:
         Returns:
             List of chunks mentioning the entity.
         """
-        # Hierarchy: Document -> Page -> Section -> Chunk
+        if self.schema_type == "legacy":
+            return await self._entity_search_legacy(
+                entity_name, dataroom_id, entity_type, top_k
+            )
+        else:
+            return await self._entity_search_graphrag(
+                entity_name, dataroom_id, entity_type, top_k
+            )
+
+    async def _entity_search_legacy(
+        self,
+        entity_name: str,
+        dataroom_id: str,
+        entity_type: Optional[str] = None,
+        top_k: int = 10,
+    ) -> list[RetrievalResult]:
+        """Entity search using legacy schema (Section-based)."""
         query = """
         MATCH (e:Entity {dataroom_id: $dataroom_id})
         WHERE (e.name CONTAINS $entity_name OR e.canonical_name CONTAINS $entity_name)
@@ -415,6 +627,54 @@ class GraphRAGRetriever:
                doc.filename AS document_name,
                page.page_number AS page,
                section.title AS section_title,
+               collect(DISTINCT e.name) AS entities
+        ORDER BY score DESC
+        LIMIT $top_k
+        """
+
+        results = self.neo4j.execute_read(
+            query,
+            {"entity_name": entity_name, "dataroom_id": dataroom_id, "top_k": top_k, "entity_type": entity_type},
+        )
+
+        return [
+            RetrievalResult(
+                chunk_id=r["chunk_id"],
+                text=r["text"],
+                score=r["score"],
+                document_id=r["document_id"],
+                document_path=r["document_path"],
+                document_name=r["document_name"],
+                page=r.get("page"),
+                section_title=r.get("section_title"),
+                entities=r["entities"],
+                source="entity",
+            )
+            for r in results
+        ]
+
+    async def _entity_search_graphrag(
+        self,
+        entity_name: str,
+        dataroom_id: str,
+        entity_type: Optional[str] = None,
+        top_k: int = 10,
+    ) -> list[RetrievalResult]:
+        """Entity search using GraphRAG schema (metadata-based)."""
+        query = """
+        MATCH (e:Entity {dataroom_id: $dataroom_id})
+        WHERE (e.name CONTAINS $entity_name OR e.canonical_name CONTAINS $entity_name)
+        AND CASE WHEN $entity_type IS NOT NULL THEN e.entity_type = $entity_type ELSE true END
+        MATCH (c:Chunk)-[r:MENTIONS]->(e)
+        MATCH (c)-[:FROM_DOCUMENT]->(doc:Document)
+        RETURN DISTINCT c.id AS chunk_id,
+               c.text AS text,
+               r.confidence AS score,
+               doc.id AS document_id,
+               doc.full_path AS document_path,
+               doc.filename AS document_name,
+               c.page_number AS page,
+               c.section_title AS section_title,
                collect(DISTINCT e.name) AS entities
         ORDER BY score DESC
         LIMIT $top_k

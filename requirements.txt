@@ -8,7 +8,10 @@ python-dotenv>=1.0
 
 # Neo4j
 neo4j>=5.0
-neo4j-graphrag>=0.5
+neo4j-graphrag>=1.0
+
+# Fuzzy matching for entity resolution
+rapidfuzz>=3.0
 
 # Unstructured
 unstructured-client>=0.20
