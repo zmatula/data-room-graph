@@ -9,7 +9,14 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from ...backend.ingestion.pipeline import IngestionPipeline, IngestionProgress, IngestionResult
+from ...backend.ingestion.pipeline import (
+    IngestionPipeline,
+    IngestionProgress,
+    IngestionResult,
+    create_pipeline,
+    PipelineType,
+)
+from ...backend.ingestion.graphrag_pipeline import GraphRAGPipeline, GraphRAGIngestionProgress
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,8 @@ class IngestionTask:
 
     dataroom_id: str
     folder_path: str
+    pipeline_type: PipelineType = "graphrag"  # Use GraphRAG by default for entity extraction
+    extract_entities: bool = True  # Enable entity extraction
 
 
 class IngestionWorker(QObject):
@@ -87,17 +96,28 @@ class IngestionWorker(QObject):
             self._loop = _create_worker_event_loop()
             asyncio.set_event_loop(self._loop)
 
-            # Create the pipeline
-            pipeline = IngestionPipeline()
-            pipeline.set_progress_callback(self._on_progress)
+            # Create the pipeline using factory function
+            pipeline = create_pipeline(
+                pipeline_type=self._task.pipeline_type,
+                extract_entities=self._task.extract_entities,
+            )
+
+            # Set progress callback (works for both pipeline types)
+            if hasattr(pipeline, 'set_progress_callback'):
+                pipeline.set_progress_callback(self._on_progress_wrapper)
 
             # Run the async ingestion
             folder_path = Path(self._task.folder_path)
+            logger.info(
+                f"Starting {self._task.pipeline_type} pipeline ingestion for {folder_path}"
+            )
             result = self._loop.run_until_complete(
                 pipeline.ingest_folder(self._task.dataroom_id, folder_path)
             )
 
             if not self._cancelled:
+                # Both pipeline types now return compatible IngestionResult
+                # GraphRAGIngestionResult has same structure as IngestionResult
                 self.ingestion_completed.emit(result)
 
         except Exception as e:
@@ -111,12 +131,38 @@ class IngestionWorker(QObject):
                 self._loop = None
 
     def _on_progress(self, progress: IngestionProgress):
-        """Handle progress updates from the pipeline.
+        """Handle progress updates from the legacy pipeline.
 
         Args:
             progress: Current ingestion progress.
         """
         if not self._cancelled:
+            self.progress_updated.emit(progress)
+
+    def _on_progress_wrapper(self, progress):
+        """Handle progress updates from either pipeline type.
+
+        Converts GraphRAG progress to legacy format for UI compatibility.
+
+        Args:
+            progress: Progress object (IngestionProgress or GraphRAGIngestionProgress).
+        """
+        if self._cancelled:
+            return
+
+        # Convert GraphRAG progress to legacy format if needed
+        if isinstance(progress, GraphRAGIngestionProgress):
+            legacy_progress = IngestionProgress(
+                total_files=progress.total_documents,
+                processed_files=progress.processed_documents,
+                total_chunks=0,  # Not tracked in GraphRAG progress
+                current_file=progress.current_file,
+                status=progress.status,
+                error_message=progress.error_message,
+                entities_found=progress.entities_extracted,
+            )
+            self.progress_updated.emit(legacy_progress)
+        else:
             self.progress_updated.emit(progress)
 
     def cancel(self):

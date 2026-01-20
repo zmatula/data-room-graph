@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QCheckBox
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtCore import Qt, Signal, Slot, QObject, QUrl
@@ -99,6 +99,7 @@ class GraphViewWidget(QWidget):
         """
         super().__init__(parent)
         self._dataroom_id: Optional[str] = None
+        self._show_all: bool = False
         self.neo4j = neo4j_client or get_neo4j_client()
         self._setup_ui()
 
@@ -121,6 +122,12 @@ class GraphViewWidget(QWidget):
         toolbar.addWidget(refresh_btn)
 
         toolbar.addStretch()
+
+        # Show All checkbox
+        self.show_all_checkbox = QCheckBox("Show All")
+        self.show_all_checkbox.setToolTip("Show all nodes and relationships in the dataroom")
+        self.show_all_checkbox.stateChanged.connect(self._on_show_all_changed)
+        toolbar.addWidget(self.show_all_checkbox)
 
         layout.addLayout(toolbar)
 
@@ -164,6 +171,12 @@ class GraphViewWidget(QWidget):
                 self._do_refresh()
         else:
             logger.error("Failed to load graph HTML page")
+
+    def _on_show_all_changed(self, state: int):
+        """Handle Show All checkbox state change."""
+        self._show_all = state == 2  # Qt.Checked = 2
+        logger.info(f"Show All mode: {self._show_all}")
+        self.refresh()
 
     def set_dataroom(self, dataroom_id: str):
         """Set the current data room.
@@ -224,18 +237,21 @@ class GraphViewWidget(QWidget):
                 })
 
             # Get Documents directly connected to DataRoom
+            # Use elementId() since neo4j-graphrag documents may not have id property
             doc_query = """
             MATCH (d:Document {dataroom_id: $dataroom_id})
-            RETURN d.id as id, d.filename as name, d.doc_type as doc_type,
+            RETURN elementId(d) as id, d.filename as name, d.doc_type as doc_type,
                    d.full_path as path, d.chunk_count as chunk_count
             LIMIT 50
             """
             doc_results = self.neo4j.execute_read(doc_query, {"dataroom_id": self._dataroom_id})
 
+            doc_ids = set()  # Track document IDs for chunk connections
             for doc in doc_results or []:
+                doc_ids.add(doc["id"])
                 nodes.append({
                     "id": doc["id"],
-                    "name": doc["name"],
+                    "name": doc["name"] or "Document",
                     "type": "Document",
                     "doc_type": doc.get("doc_type"),
                     "path": doc.get("path"),
@@ -302,16 +318,24 @@ class GraphViewWidget(QWidget):
                     "type": "HAS_PAGE",
                 })
 
-            # Get Chunks that have MENTIONS relationships (these connect to entities)
-            # Hierarchy: Document -> Page -> Section -> Chunk
-            chunk_query = """
-            MATCH (c:Chunk {dataroom_id: $dataroom_id})-[:MENTIONS]->(e:Entity)
-            MATCH (c)<-[:CONTAINS]-(s:Section)
-            MATCH (c)-[:ON_PAGE]->(p:Page)
-            RETURN DISTINCT c.id as id, c.text as text, c.element_type as element_type,
-                   p.page_number as page, s.id as section_id
-            LIMIT 100
-            """
+            # Get Chunks - either all chunks (show_all) or only those with entity mentions
+            # neo4j-graphrag uses: (Entity)-[:MENTIONED_IN]->(Chunk)-[:FROM_DOCUMENT]->(Document)
+            if self._show_all:
+                # Show ALL chunks in the dataroom
+                chunk_query = """
+                MATCH (c:Chunk {dataroom_id: $dataroom_id})
+                OPTIONAL MATCH (c)-[:FROM_DOCUMENT]->(d:Document)
+                RETURN DISTINCT elementId(c) as id, c.text as text, elementId(d) as doc_id
+                LIMIT 500
+                """
+            else:
+                # Only show chunks that have entity mentions
+                chunk_query = """
+                MATCH (e:__Entity__ {dataroom_id: $dataroom_id})-[:MENTIONED_IN]->(c:Chunk)
+                OPTIONAL MATCH (c)-[:FROM_DOCUMENT]->(d:Document)
+                RETURN DISTINCT elementId(c) as id, c.text as text, elementId(d) as doc_id
+                LIMIT 100
+                """
             chunk_results = self.neo4j.execute_read(chunk_query, {"dataroom_id": self._dataroom_id})
 
             for chunk in chunk_results or []:
@@ -321,24 +345,26 @@ class GraphViewWidget(QWidget):
                     "name": text[:40] + "..." if len(text) > 40 else text,
                     "type": "Chunk",
                     "text": text,
-                    "page": chunk.get("page"),
                     "size": 10,
                 })
-                # Edge from Section to Chunk
-                if chunk.get("section_id"):
+                # Edge from Document to Chunk (use elementId for doc)
+                if chunk.get("doc_id"):
                     edges.append({
-                        "id": f"edge_{chunk['section_id']}_{chunk['id']}",
-                        "from": chunk["section_id"],
+                        "id": f"edge_{chunk['doc_id']}_{chunk['id']}",
+                        "from": chunk["doc_id"],
                         "to": chunk["id"],
-                        "type": "CONTAINS",
+                        "type": "FROM_DOCUMENT",
                     })
 
-            # Get Entities
-            entity_query = """
-            MATCH (e:Entity {dataroom_id: $dataroom_id})
-            RETURN e.id as id, e.canonical_name as name, e.entity_type as type,
-                   e.mention_count as mentions
-            LIMIT 50
+            # Get Entities (neo4j-graphrag uses __Entity__ label, type is in labels)
+            entity_limit = 500 if self._show_all else 50
+            entity_query = f"""
+            MATCH (e:__Entity__ {{dataroom_id: $dataroom_id}})
+            WITH e, [l IN labels(e) WHERE NOT l IN ['__Entity__', '__KGBuilder__']][0] AS entity_type
+            OPTIONAL MATCH (e)-[r:MENTIONED_IN]->()
+            WITH e, entity_type, count(r) as mentions
+            RETURN elementId(e) as id, e.name as name, entity_type as type, mentions
+            LIMIT {entity_limit}
             """
             entity_results = self.neo4j.execute_read(entity_query, {"dataroom_id": self._dataroom_id})
             logger.info(f"Entity query returned {len(entity_results) if entity_results else 0} entities")
@@ -352,11 +378,13 @@ class GraphViewWidget(QWidget):
                     "size": 14 + min(entity.get("mentions", 0) or 0, 20) * 0.5,
                 })
 
-            # Get MENTIONS relationships (Chunk -> Entity)
-            mentions_query = """
-            MATCH (c:Chunk {dataroom_id: $dataroom_id})-[r:MENTIONS]->(e:Entity)
-            RETURN c.id as chunk_id, e.id as entity_id
-            LIMIT 100
+            # Get MENTIONED_IN relationships (Entity -> Chunk in neo4j-graphrag)
+            # Visualize as Chunk -> Entity (chunk mentions entity)
+            mentions_limit = 1000 if self._show_all else 100
+            mentions_query = f"""
+            MATCH (e:__Entity__ {{dataroom_id: $dataroom_id}})-[r:MENTIONED_IN]->(c:Chunk)
+            RETURN elementId(c) as chunk_id, elementId(e) as entity_id
+            LIMIT {mentions_limit}
             """
             mentions_results = self.neo4j.execute_read(mentions_query, {"dataroom_id": self._dataroom_id})
 

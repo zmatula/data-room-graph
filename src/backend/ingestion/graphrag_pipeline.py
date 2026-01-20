@@ -18,7 +18,7 @@ from neo4j_graphrag.embeddings import OpenAIEmbeddings
 from neo4j_graphrag.experimental.pipeline.kg_builder import SimpleKGPipeline
 from neo4j_graphrag.experimental.components.text_splitters.base import TextSplitter
 from neo4j_graphrag.experimental.components.types import TextChunks, TextChunk
-from neo4j_graphrag.llm import AnthropicLLM
+from neo4j_graphrag.llm import OpenAILLM
 
 from .pe_schema import PE_SCHEMA, LEXICAL_GRAPH_CONFIG
 from .pe_prompt import get_extraction_prompt, get_extraction_examples
@@ -129,7 +129,7 @@ class GraphRAGPipeline:
         neo4j_client: Optional[Neo4jClient] = None,
         preprocessor: Optional[DocumentPreprocessor] = None,
         embedding_model: str = "text-embedding-3-large",
-        llm_model: str = "claude-sonnet-4-20250514",
+        llm_model: str = "gpt-4o",
         perform_entity_resolution: bool = True,
         perform_cross_type_resolution: bool = True,
         perform_validation: bool = True,
@@ -141,7 +141,7 @@ class GraphRAGPipeline:
             neo4j_client: Neo4j client for database operations.
             preprocessor: Document preprocessor.
             embedding_model: OpenAI embedding model name.
-            llm_model: Anthropic LLM model name for extraction.
+            llm_model: OpenAI LLM model name for extraction.
             perform_entity_resolution: Whether to run entity resolution.
             perform_cross_type_resolution: Whether to run cross-type entity resolution.
             perform_validation: Whether to run extraction validation.
@@ -204,10 +204,16 @@ class GraphRAGPipeline:
         settings = get_settings()
 
         # Initialize LLM
-        llm = AnthropicLLM(
+        # Using OpenAI with response_format for guaranteed JSON output,
+        # which eliminates format errors from entity extraction
+        llm = OpenAILLM(
             model_name=self.llm_model,
-            model_params={"max_tokens": 4000},
-            api_key=settings.anthropic_api_key,
+            model_params={
+                "max_tokens": 4000,
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+            api_key=settings.openai_api_key,
         )
 
         # Initialize embedder
@@ -294,10 +300,25 @@ class GraphRAGPipeline:
                 folder_id,
             )
 
+            # Extract counts from PipelineResult if available
+            # The result is a Pydantic model, not a dict
+            entities_count = 0
+            relationships_count = 0
+            if result:
+                # Try to access run_result which contains the actual data
+                if hasattr(result, 'run_result') and result.run_result:
+                    run_result = result.run_result
+                    if hasattr(run_result, 'get'):
+                        entities_count = run_result.get("entities", 0)
+                        relationships_count = run_result.get("relationships", 0)
+                    elif hasattr(run_result, 'entities'):
+                        entities_count = getattr(run_result, 'entities', 0) or 0
+                        relationships_count = getattr(run_result, 'relationships', 0) or 0
+
             self._update_progress(
                 status="completed",
                 processed_documents=1,
-                entities_extracted=result.get("entities", 0) if result else 0,
+                entities_extracted=entities_count,
             )
 
             duration = (datetime.utcnow() - start_time).total_seconds()
@@ -306,8 +327,8 @@ class GraphRAGPipeline:
                 dataroom_id=dataroom_id,
                 documents_processed=1,
                 chunks_created=preprocessed.chunk_count,
-                entities_extracted=result.get("entities", 0) if result else 0,
-                relationships_created=result.get("relationships", 0) if result else 0,
+                entities_extracted=entities_count,
+                relationships_created=relationships_count,
                 duration_seconds=duration,
             )
 
@@ -476,13 +497,18 @@ class GraphRAGPipeline:
             folder_id: Optional folder ID.
         """
         # Update Document nodes with dataroom context
+        # neo4j-graphrag stores documents with path="document.txt" for inline text,
+        # so we match documents without dataroom_id that have chunks related to them.
+        # This assumes we're processing one document at a time.
         update_doc_query = """
         MATCH (d:Document)
-        WHERE d.path = $file_path OR d.text CONTAINS $filename
+        WHERE d.dataroom_id IS NULL
         SET d.dataroom_id = $dataroom_id,
             d.folder_id = $folder_id,
             d.doc_type = $doc_type,
-            d.doc_type_confidence = $confidence
+            d.doc_type_confidence = $confidence,
+            d.original_path = $file_path,
+            d.filename = $filename
         """
 
         self.neo4j.execute_write(
@@ -509,10 +535,16 @@ class GraphRAGPipeline:
         )
 
         # Update Entity nodes with dataroom context
+        # Note: neo4j-graphrag creates nodes with specific labels (Fund, Manager, etc.)
+        # not a generic Entity label, so we match all PE entity types explicitly.
+        # Neo4j 5.x requires IS NULL instead of NOT EXISTS() for property checks.
+        # neo4j-graphrag uses MENTIONED_IN relationship (entity)-[:MENTIONED_IN]->(chunk)
         update_entity_query = """
-        MATCH (e:Entity)
-        WHERE NOT EXISTS(e.dataroom_id)
-        MATCH (e)<-[:MENTIONS]-(c:Chunk {dataroom_id: $dataroom_id})
+        MATCH (e)
+        WHERE e.dataroom_id IS NULL
+          AND (e:Fund OR e:Manager OR e:Person OR e:ServiceProvider
+               OR e:Investor OR e:PortfolioCompany OR e:Location OR e:Asset OR e:Vehicle)
+        MATCH (e)-[:MENTIONED_IN]->(c:Chunk {dataroom_id: $dataroom_id})
         SET e.dataroom_id = $dataroom_id
         """
 

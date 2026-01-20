@@ -262,7 +262,7 @@ class DashboardWidget(QWidget):
                 MATCH (dr:DataRoom {id: $dataroom_id})
                 OPTIONAL MATCH (d:Document {dataroom_id: $dataroom_id})
                 OPTIONAL MATCH (c:Chunk {dataroom_id: $dataroom_id})
-                OPTIONAL MATCH (e:Entity {dataroom_id: $dataroom_id})
+                OPTIONAL MATCH (e:__Entity__ {dataroom_id: $dataroom_id})
                 RETURN
                     count(DISTINCT d) as doc_count,
                     count(DISTINCT c) as chunk_count,
@@ -322,16 +322,19 @@ class DashboardWidget(QWidget):
                     modified=str(updated),
                 )
 
-            # Fetch entities
+            # Fetch entities (neo4j-graphrag uses __Entity__ label)
             self.entities_table.setRowCount(0)
             entities_result = neo4j.execute_read(
                 """
-                MATCH (e:Entity {dataroom_id: $dataroom_id})
-                RETURN e.canonical_name as name,
-                       e.entity_type as entity_type,
-                       e.mention_count as mentions,
-                       e.confidence as confidence
-                ORDER BY e.mention_count DESC
+                MATCH (e:__Entity__ {dataroom_id: $dataroom_id})
+                WITH e, [l IN labels(e) WHERE NOT l IN ['__Entity__', '__KGBuilder__']][0] AS entity_type
+                OPTIONAL MATCH (e)-[r:MENTIONED_IN]->()
+                WITH e, entity_type, count(r) as mentions
+                RETURN e.name as name,
+                       entity_type as entity_type,
+                       mentions,
+                       1.0 as confidence
+                ORDER BY mentions DESC
                 LIMIT 100
                 """,
                 {"dataroom_id": self._dataroom_id},
