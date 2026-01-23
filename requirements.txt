@@ -16,6 +16,9 @@ rapidfuzz>=3.0
 # Unstructured
 unstructured-client>=0.20
 
+# PDF processing for VLM extraction
+pymupdf>=1.26
+
 # Embeddings
 openai>=1.0
 
