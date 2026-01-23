@@ -269,8 +269,8 @@ class GraphViewWidget(QWidget):
             # First get unique sections
             section_query = """
             MATCH (s:Section {dataroom_id: $dataroom_id})<-[:HAS_SECTION]-(p:Page)<-[:HAS_PAGE]-(d:Document)
-            RETURN DISTINCT s.id as id, s.title as title, s.description as description,
-                   s.hierarchy_level as level, collect(DISTINCT p.id)[0] as page_id
+            RETURN DISTINCT elementId(s) as id, s.title as title, s.description as description,
+                   s.hierarchy_level as level, collect(DISTINCT elementId(p))[0] as page_id
             LIMIT 50
             """
             section_results = self.neo4j.execute_read(section_query, {"dataroom_id": self._dataroom_id})
@@ -297,12 +297,14 @@ class GraphViewWidget(QWidget):
             # Get Pages (limited sample)
             page_query = """
             MATCH (p:Page {dataroom_id: $dataroom_id})<-[:HAS_PAGE]-(d:Document)
-            RETURN p.id as id, p.page_number as page_number, d.id as doc_id
+            RETURN elementId(p) as id, p.page_number as page_number, elementId(d) as doc_id
             LIMIT 50
             """
             page_results = self.neo4j.execute_read(page_query, {"dataroom_id": self._dataroom_id})
 
+            page_ids = set()  # Track page IDs (elementId) for chunk connections
             for page in page_results or []:
+                page_ids.add(page["id"])
                 nodes.append({
                     "id": page["id"],
                     "name": f"Page {page['page_number']}",
@@ -318,22 +320,31 @@ class GraphViewWidget(QWidget):
                     "type": "HAS_PAGE",
                 })
 
+            # Query for Page -> Chunk edges (to connect later)
+            page_to_chunk_map = []
+            if page_ids:
+                page_chunk_query = """
+                MATCH (p:Page {dataroom_id: $dataroom_id})-[:HAS_CHUNK]->(c:Chunk)
+                RETURN elementId(p) as page_id, elementId(c) as chunk_id
+                LIMIT 200
+                """
+                page_chunk_results = self.neo4j.execute_read(page_chunk_query, {"dataroom_id": self._dataroom_id})
+                page_to_chunk_map = [(r["page_id"], r["chunk_id"]) for r in page_chunk_results or []]
+                logger.info(f"Found {len(page_to_chunk_map)} Page->Chunk relationships")
+
             # Get Chunks - either all chunks (show_all) or only those with entity mentions
-            # neo4j-graphrag uses: (Entity)-[:MENTIONED_IN]->(Chunk)-[:FROM_DOCUMENT]->(Document)
             if self._show_all:
                 # Show ALL chunks in the dataroom
                 chunk_query = """
                 MATCH (c:Chunk {dataroom_id: $dataroom_id})
-                OPTIONAL MATCH (c)-[:FROM_DOCUMENT]->(d:Document)
-                RETURN DISTINCT elementId(c) as id, c.text as text, elementId(d) as doc_id
+                RETURN DISTINCT elementId(c) as id, c.text as text
                 LIMIT 500
                 """
             else:
                 # Only show chunks that have entity mentions
                 chunk_query = """
                 MATCH (e:__Entity__ {dataroom_id: $dataroom_id})-[:MENTIONED_IN]->(c:Chunk)
-                OPTIONAL MATCH (c)-[:FROM_DOCUMENT]->(d:Document)
-                RETURN DISTINCT elementId(c) as id, c.text as text, elementId(d) as doc_id
+                RETURN DISTINCT elementId(c) as id, c.text as text
                 LIMIT 100
                 """
             chunk_results = self.neo4j.execute_read(chunk_query, {"dataroom_id": self._dataroom_id})
@@ -347,14 +358,20 @@ class GraphViewWidget(QWidget):
                     "text": text,
                     "size": 10,
                 })
-                # Edge from Document to Chunk (use elementId for doc)
-                if chunk.get("doc_id"):
+
+            # Add Page -> Chunk edges
+            chunk_ids = {n["id"] for n in nodes if n["type"] == "Chunk"}
+            page_chunk_edges_added = 0
+            for page_id, chunk_id in page_to_chunk_map:
+                if page_id in page_ids and chunk_id in chunk_ids:
                     edges.append({
-                        "id": f"edge_{chunk['doc_id']}_{chunk['id']}",
-                        "from": chunk["doc_id"],
-                        "to": chunk["id"],
-                        "type": "FROM_DOCUMENT",
+                        "id": f"edge_{page_id}_{chunk_id}",
+                        "from": page_id,
+                        "to": chunk_id,
+                        "type": "HAS_CHUNK",
                     })
+                    page_chunk_edges_added += 1
+            logger.info(f"Added {page_chunk_edges_added} Page->Chunk edges")
 
             # Get Entities (neo4j-graphrag uses __Entity__ label, type is in labels)
             entity_limit = 500 if self._show_all else 50
@@ -401,6 +418,29 @@ class GraphViewWidget(QWidget):
                     })
                     mentions_added += 1
             logger.info(f"Added {mentions_added} MENTIONS edges (from {len(mentions_results) if mentions_results else 0} total)")
+
+            # Get Entity-to-Entity relationships
+            entity_rel_limit = 200 if self._show_all else 50
+            entity_rel_query = f"""
+            MATCH (e1:__Entity__ {{dataroom_id: $dataroom_id}})-[r]->(e2:__Entity__ {{dataroom_id: $dataroom_id}})
+            WHERE type(r) IN ['MANAGES', 'INVESTS_IN', 'PROVIDES_SERVICE_TO', 'AFFILIATED_WITH', 'EMPLOYED_BY']
+            RETURN elementId(e1) as from_id, elementId(e2) as to_id, type(r) as rel_type
+            LIMIT {entity_rel_limit}
+            """
+            entity_rel_results = self.neo4j.execute_read(entity_rel_query, {"dataroom_id": self._dataroom_id})
+
+            entity_ids = {n["id"] for n in nodes if n["type"] not in ["DataRoom", "Document", "Page", "Chunk", "Section"]}
+            entity_rels_added = 0
+            for rel in entity_rel_results or []:
+                if rel["from_id"] in entity_ids and rel["to_id"] in entity_ids:
+                    edges.append({
+                        "id": f"edge_entity_{rel['rel_type']}_{rel['from_id']}_{rel['to_id']}",
+                        "from": rel["from_id"],
+                        "to": rel["to_id"],
+                        "type": rel["rel_type"],
+                    })
+                    entity_rels_added += 1
+            logger.info(f"Added {entity_rels_added} entity-entity relationship edges")
 
             # Log node type breakdown
             node_types = {}
